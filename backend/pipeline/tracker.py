@@ -1,8 +1,7 @@
-"""BoxMOT BoT-SORT tracker wrapper.
+"""BoxMOT BoT-SORT tracker wrapper with osnet_x1_0 ReID backbone.
 
 Returns per-frame track data: {track_id: {"xyxy": np.ndarray, "conf": float}}
 """
-from pathlib import Path
 from typing import Dict, List, Any
 
 import numpy as np
@@ -13,14 +12,11 @@ from core.config import settings
 class Tracker:
     def __init__(self):
         from boxmot import BotSort
-        from boxmot.reid.core.auto_backend import ReidAutoBackend
-        import inspect
         import torch
 
-        default_weights = inspect.signature(ReidAutoBackend.__init__).parameters["weights"].default
-        print(f"[tracker] loading ReID weights from {default_weights}…")
+        print(f"[tracker] loading BoT-SORT with {settings.reid_model}…")
         self._tracker = BotSort(
-            reid_weights=default_weights,
+            reid_weights=settings.reid_model,
             device=torch.device(settings.device),
             half=False,
         )

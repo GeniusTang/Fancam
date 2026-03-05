@@ -1,5 +1,6 @@
-"""Background worker: runs analysis and generation pipelines."""
+"""Background worker: runs analysis, preview, and generation pipelines."""
 import asyncio
+import time
 import traceback
 from collections import defaultdict
 from pathlib import Path
@@ -41,6 +42,7 @@ async def run_analysis(job_id: str, video_path: Path):
 
         # ── Phase 1: detect + track (runs in thread — blocks CPU freely) ──
         push(stage=AnalysisStage.TRACKING, progress=0.02)
+        t0 = time.monotonic()
         track_fragments = await loop.run_in_executor(
             None, lambda: _sync_detect_track(video_path, total_frames, push)
         )
@@ -79,7 +81,7 @@ async def run_analysis(job_id: str, video_path: Path):
         cluster_map = cluster_persons(track_ids, embeddings, spans)
 
         unique_clusters = set(cluster_map.values())
-        print(f"[worker] DBSCAN → {len(unique_clusters)} clusters: {dict(sorted(cluster_map.items()))}")
+        print(f"[worker] clustering → {len(unique_clusters)} clusters: {dict(sorted(cluster_map.items()))}")
 
         await _set(job_id, stage=AnalysisStage.THUMBNAILING, progress=0.7)
 
@@ -119,6 +121,8 @@ async def run_analysis(job_id: str, video_path: Path):
         _track_fragments_cache[job_id] = dict(track_fragments)
         _cluster_map_cache[job_id] = cluster_map
 
+        elapsed = time.monotonic() - t0
+        print(f"[worker] analysis complete in {elapsed:.1f}s")
         await _set(job_id, status=JobStatus.READY_FOR_SELECTION, stage=None, progress=1.0)
 
     except Exception as e:
@@ -126,8 +130,35 @@ async def run_analysis(job_id: str, video_path: Path):
         print(f"[worker] analysis error for {job_id}:\n{traceback.format_exc()}")
 
 
+async def run_preview(job_id: str, person_id: str, video_path: Path) -> Path:
+    """Generate a short preview clip with bbox overlay for the selected person."""
+    loop = asyncio.get_running_loop()
+
+    cluster_map = _cluster_map_cache.get(job_id, {})
+    track_fragments = _track_fragments_cache.get(job_id, {})
+    if not cluster_map:
+        raise ValueError("Analysis data not found — re-upload")
+
+    cluster_id = int(person_id.replace("person_", ""))
+    frame_track_map: Dict[int, np.ndarray] = {}
+    for tid, cid in cluster_map.items():
+        if cid == cluster_id and tid in track_fragments:
+            for frame_idx, xyxy, _ in track_fragments[tid]:
+                frame_track_map[frame_idx] = xyxy
+
+    if not frame_track_map:
+        raise ValueError(f"No track data for {person_id}")
+
+    preview_path = await loop.run_in_executor(
+        None,
+        lambda: _sync_preview(video_path, frame_track_map, job_id, person_id),
+    )
+    return preview_path
+
+
 async def run_generation(job_id: str, person_id: str, video_path: Path):
     loop = asyncio.get_running_loop()
+    t0 = time.monotonic()
 
     def push(**kwargs):
         loop.call_soon_threadsafe(
@@ -155,13 +186,32 @@ async def run_generation(job_id: str, person_id: str, video_path: Path):
             return
 
         out_path = output_path(job_id)
+
+        # Get total frames for ETA calculation
+        cap = cv2.VideoCapture(str(video_path))
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        cap.release()
+
+        frames_done = [0]
+
+        def progress_with_eta(p: float):
+            frames_done[0] = int(p * total_frames)
+            elapsed = time.monotonic() - t0
+            if p > 0.05:
+                eta = elapsed / p * (1 - p)
+            else:
+                eta = -1  # not enough data
+            push(progress=p * 0.9, eta=round(eta, 1) if eta > 0 else None)
+
         await loop.run_in_executor(
             None,
-            lambda: _sync_render(video_path, out_path, frame_track_map, push),
+            lambda: _sync_render(video_path, out_path, frame_track_map, progress_with_eta),
         )
 
+        elapsed = time.monotonic() - t0
+        print(f"[worker] generation complete in {elapsed:.1f}s")
         await _set(job_id, status=JobStatus.COMPLETE, stage=None, progress=1.0,
-                   output_filename=out_path.name)
+                   output_filename=out_path.name, eta=None)
 
     except Exception as e:
         await _set(job_id, status=JobStatus.ERROR, error=str(e))
@@ -184,6 +234,7 @@ def _sync_detect_track(
     print("[worker] detector + tracker ready")
 
     track_fragments: Dict[int, List[Tuple[int, np.ndarray, float]]] = defaultdict(list)
+    t0 = time.monotonic()
 
     total_dets = 0
     for frame_idx, total, frame, detections in detector.detect_video(video_path):
@@ -194,7 +245,12 @@ def _sync_detect_track(
 
         if frame_idx % 30 == 0:
             progress = 0.02 + 0.45 * (frame_idx / max(total, 1))
-            push(progress=progress)
+            elapsed = time.monotonic() - t0
+            if frame_idx > 0:
+                eta = elapsed / frame_idx * (total - frame_idx)
+            else:
+                eta = -1
+            push(progress=progress, eta=round(eta, 1) if eta > 0 else None)
 
     avg_dets = total_dets / max(total_frames, 1)
     print(f"[worker] detect+track done: {total_frames} frames, "
@@ -209,15 +265,9 @@ def _sync_embed(
     try:
         from pipeline.reid_embedder import ReIDEmbedder
         embedder = ReIDEmbedder()
-        fragments_for_embed = {
-            tid: [(f, xyxy) for f, xyxy, _ in obs]
-            for tid, obs in track_fragments.items()
-        }
-        return embedder.embed_fragments(video_path, fragments_for_embed)
+        return embedder.embed_fragments(video_path, track_fragments)
     except Exception as e:
         print(f"[worker] ReID embedder unavailable ({e}), using bbox fallback")
-        # Use mean [cx_norm, cy_norm, w_norm, h_norm] as embedding.
-        # Normalise by frame dims so spatial position distinguishes people.
         cap = cv2.VideoCapture(str(video_path))
         fw = cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 1920
         fh = cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 1080
@@ -232,8 +282,6 @@ def _sync_embed(
                 h  = (xyxy[3] - xyxy[1]) / fh
                 vecs.append([cx, cy, w, h])
             arr = np.array(vecs, dtype=np.float32).mean(axis=0)
-            # Tile the 4-dim feature to fill the embedding dimension
-            # so cosine distance reflects actual spatial differences
             tiled = np.tile(arr, 128).astype(np.float32)  # 512-dim
             norm = np.linalg.norm(tiled)
             embeddings[tid] = tiled / norm if norm > 0 else tiled
@@ -253,9 +301,76 @@ def _sync_render(video_path, out_path, frame_track_map, push):
     def cb(p: float):
         if p - last[0] >= 0.02:
             last[0] = p
-            push(progress=p * 0.9)
+            push(p)
 
     FancamRenderer().render(video_path, out_path, frame_track_map, cb)
+
+
+def _sync_preview(
+    video_path: Path,
+    frame_track_map: Dict[int, np.ndarray],
+    job_id: str,
+    person_id: str,
+) -> Path:
+    """Generate a short preview clip with bbox overlay from the middle of the video."""
+    from core.config import settings
+
+    cap = cv2.VideoCapture(str(video_path))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    preview_frames = int(fps * settings.preview_duration)
+
+    # Find the middle of the person's appearance
+    sorted_frames = sorted(frame_track_map.keys())
+    mid_idx = len(sorted_frames) // 2
+    mid_frame = sorted_frames[mid_idx]
+
+    # Center the preview window around the middle frame
+    start_frame = max(0, mid_frame - preview_frames // 2)
+    end_frame = min(total, start_frame + preview_frames)
+    start_frame = max(0, end_frame - preview_frames)
+
+    preview_path = settings.output_dir / f"{job_id}_preview_{person_id}.mp4"
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(str(preview_path), fourcc, fps, (frame_w, frame_h))
+
+    cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+    for fidx in range(start_frame, end_frame):
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        xyxy = frame_track_map.get(fidx)
+        if xyxy is not None:
+            x1, y1, x2, y2 = [int(v) for v in xyxy]
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (124, 106, 255), 3)
+
+        writer.write(frame)
+
+    cap.release()
+    writer.release()
+
+    # Re-encode for browser compatibility
+    import ffmpeg
+    final_path = preview_path.with_suffix(".final.mp4")
+    try:
+        (
+            ffmpeg.input(str(preview_path))
+            .output(str(final_path), vcodec="libx264", crf=23, preset="ultrafast",
+                    movflags="+faststart", r=fps)
+            .overwrite_output()
+            .run(quiet=True)
+        )
+        preview_path.unlink(missing_ok=True)
+        final_path.rename(preview_path)
+    except Exception:
+        if final_path.exists():
+            final_path.unlink(missing_ok=True)
+
+    return preview_path
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
