@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# Storage (large/generated files)
+backend/storage/uploads/
+backend/storage/outputs/
+backend/storage/thumbnails/
+
+# Models (downloaded at runtime)
+backend/*.pt
+backend/**/*.pt
+
+# Node
+node_modules/
+frontend/dist/
+frontend/.vite/
+
+# Misc
+.DS_Store
+*.env
+.env.local

@@ -1,0 +1,13 @@
+fastapi
+uvicorn[standard]
+python-multipart
+ultralytics
+boxmot
+opencv-python-headless
+torch
+torchvision
+scikit-learn
+ffmpeg-python
+pydantic-settings
+numpy
+aiofiles
