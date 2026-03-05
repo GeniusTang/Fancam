@@ -23,7 +23,7 @@ async def generate_fancam(req: GenerateRequest):
     job = job_store.get(req.job_id)
     if job is None:
         raise HTTPException(404, "Job not found")
-    if job.status != JobStatus.READY_FOR_SELECTION:
+    if job.status not in (JobStatus.READY_FOR_SELECTION, JobStatus.PREVIEWING):
         raise HTTPException(409, f"Job not ready for generation (status: {job.status})")
 
     persons = job_store.get_persons(req.job_id)

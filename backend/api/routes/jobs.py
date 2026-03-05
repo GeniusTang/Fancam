@@ -58,4 +58,6 @@ def _format(job: Job) -> str:
     }
     if job.error:
         data["error"] = job.error
+    if job.eta is not None:
+        data["eta"] = job.eta
     return f"data: {json.dumps(data)}\n\n"

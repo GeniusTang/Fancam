@@ -4,6 +4,7 @@ import { useJobStatus } from "./hooks/useJobStatus";
 import { UploadZone } from "./components/UploadZone";
 import { ProgressPanel } from "./components/ProgressPanel";
 import { DancerGrid } from "./components/DancerGrid";
+import { PreviewPanel } from "./components/PreviewPanel";
 import { ResultPanel } from "./components/ResultPanel";
 
 const errorStyles: React.CSSProperties = {
@@ -59,6 +60,8 @@ export default function App() {
       return <ProgressPanel />;
     case "select_dancer":
       return <DancerGrid />;
+    case "previewing":
+      return <PreviewPanel />;
     case "complete":
       return <ResultPanel />;
     default:

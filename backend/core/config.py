@@ -20,19 +20,18 @@ class Settings(BaseSettings):
     fancam_width: int = 720
     fancam_height: int = 1280
 
-    yolo_model: str = "yolov8s.pt"        # small model — better accuracy than nano
+    yolo_model: str = "yolov8x.pt"        # extra-large — best accuracy for occluded/overlapping
     yolo_conf: float = 0.45               # raise from default 0.25 to cut false positives
     min_person_area: float = 0.005        # ignore boxes < 0.5% of frame (distant crowd)
     max_person_area: float = 0.80         # ignore boxes > 80% of frame (full-frame artefacts)
-    reid_model: str = "osnet_x0_25_msmt17.pt"
-    tracker_config: str = "botsort.yaml"
+    reid_model: str = "osnet_x1_0_msmt17.pt"
     device: str = _best_device()
 
     cluster_distance_threshold: float = 0.25   # complete-linkage cosine distance
-    embedding_sample_frames: int = 10
+    embedding_sample_frames: int = 30
 
-    kalman_occlusion_limit: int = 60
-    ema_alpha: float = 0.12
+    gaussian_sigma: float = 15.0          # Gaussian smoothing sigma (frames); ~0.5s at 30fps
+    preview_duration: float = 5.0         # preview clip length in seconds
 
     class Config:
         env_prefix = "FANCAM_"

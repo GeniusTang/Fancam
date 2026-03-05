@@ -10,6 +10,13 @@ const STAGE_LABELS: Record<string, string> = {
   encoding: "Encoding video",
 };
 
+function formatEta(seconds: number): string {
+  if (seconds < 60) return `~${Math.round(seconds)}s remaining`;
+  const mins = Math.floor(seconds / 60);
+  const secs = Math.round(seconds % 60);
+  return `~${mins}m ${secs}s remaining`;
+}
+
 const styles: Record<string, React.CSSProperties> = {
   wrapper: {
     display: "flex",
@@ -30,6 +37,7 @@ const styles: Record<string, React.CSSProperties> = {
   },
   stage: { fontSize: 20, fontWeight: 600, margin: 0 },
   pct: { fontSize: 14, color: "#888", margin: 0 },
+  eta: { fontSize: 13, color: "#666", margin: 0 },
   bar: { width: 320, background: "#222", borderRadius: 8, height: 8 },
   fill: {
     background: "linear-gradient(90deg, #7c6aff, #ff6af0)",
@@ -45,6 +53,7 @@ export function ProgressPanel() {
 
   const stage = sseEvent?.stage ?? null;
   const progress = sseEvent?.progress ?? 0;
+  const eta = sseEvent?.eta ?? null;
   const label =
     phase === "generating"
       ? STAGE_LABELS[stage ?? "rendering"] ?? "Processing"
@@ -61,6 +70,9 @@ export function ProgressPanel() {
       <div style={styles.bar}>
         <div style={{ ...styles.fill, width: `${pct}%` }} />
       </div>
+      {eta != null && eta > 0 && (
+        <p style={styles.eta}>{formatEta(eta)}</p>
+      )}
     </div>
   );
 }

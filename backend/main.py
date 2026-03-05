@@ -4,7 +4,7 @@ warnings.filterwarnings("ignore", message="resource_tracker.*semaphore")
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from api.routes import upload, analysis, generate, jobs, download, merge
+from api.routes import upload, analysis, generate, jobs, download, merge, frames, preview
 
 app = FastAPI(title="Fancam Generator API", version="1.0.0")
 
@@ -22,6 +22,8 @@ app.include_router(analysis.router)
 app.include_router(generate.router)
 app.include_router(download.router)
 app.include_router(merge.router)
+app.include_router(frames.router)
+app.include_router(preview.router)
 
 
 @app.get("/health")

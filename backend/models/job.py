@@ -7,6 +7,7 @@ class JobStatus(str, Enum):
     PENDING = "pending"
     ANALYZING = "analyzing"
     READY_FOR_SELECTION = "ready_for_selection"
+    PREVIEWING = "previewing"
     GENERATING = "generating"
     COMPLETE = "complete"
     ERROR = "error"
@@ -35,3 +36,4 @@ class Job(BaseModel):
     selected_person_id: Optional[str] = None
     total_frames: Optional[int] = None
     fps: Optional[float] = None
+    eta: Optional[float] = None
