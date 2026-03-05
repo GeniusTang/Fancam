@@ -1,0 +1,265 @@
+"""Background worker: runs analysis and generation pipelines."""
+import asyncio
+import traceback
+from collections import defaultdict
+from pathlib import Path
+from typing import Callable, Dict, List, Tuple
+
+import cv2
+import numpy as np
+
+from core.job_store import job_store
+from models.job import JobStatus, AnalysisStage, GenerationStage
+from models.person import Person
+from storage.file_manager import output_path
+
+
+# ── In-memory caches (MVP — lost on restart) ──────────────────────────────────
+_track_fragments_cache: Dict[str, Dict] = {}
+_cluster_map_cache: Dict[str, Dict] = {}
+
+
+# ── Async entry points ────────────────────────────────────────────────────────
+
+async def run_analysis(job_id: str, video_path: Path):
+    loop = asyncio.get_running_loop()
+
+    def push(**kwargs):
+        """Thread-safe progress push to the event loop."""
+        loop.call_soon_threadsafe(
+            lambda kw=kwargs: asyncio.ensure_future(_set(job_id, **kw))
+        )
+
+    try:
+        await _set(job_id, status=JobStatus.ANALYZING, stage=AnalysisStage.DETECTING, progress=0.0)
+
+        cap = cv2.VideoCapture(str(video_path))
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        cap.release()
+        await _set(job_id, total_frames=total_frames, fps=fps)
+
+        # ── Phase 1: detect + track (runs in thread — blocks CPU freely) ──
+        push(stage=AnalysisStage.TRACKING, progress=0.02)
+        track_fragments = await loop.run_in_executor(
+            None, lambda: _sync_detect_track(video_path, total_frames, push)
+        )
+
+        if not track_fragments:
+            await _set(job_id, status=JobStatus.ERROR, error="No persons detected in video")
+            return
+
+        # Drop tracks shorter than 1 second — usually false positives
+        min_frames = max(5, int((job_store.get(job_id).fps or 30) * 1.0))
+        track_fragments = {tid: obs for tid, obs in track_fragments.items() if len(obs) >= min_frames}
+        if not track_fragments:
+            await _set(job_id, status=JobStatus.ERROR, error="No stable person tracks found (try a longer video)")
+            return
+        print(f"[worker] {len(track_fragments)} track fragments after filtering:")
+        for tid, obs in sorted(track_fragments.items(), key=lambda x: -len(x[1])):
+            frames = [o[0] for o in obs]
+            print(f"  track {tid:3d}: {len(obs):4d} frames  span={min(frames)}–{max(frames)}")
+
+        await _set(job_id, stage=AnalysisStage.CLUSTERING, progress=0.5)
+
+        # ── Phase 2: embed + cluster (in thread) ──
+        spans = {
+            tid: (min(o[0] for o in obs), max(o[0] for o in obs))
+            for tid, obs in track_fragments.items()
+        }
+        embeddings = await loop.run_in_executor(
+            None, lambda: _sync_embed(video_path, track_fragments)
+        )
+
+        print(f"[worker] embeddings: {len(embeddings)} tracks, "
+              f"dim={next(iter(embeddings.values())).shape[0] if embeddings else 0}")
+
+        from pipeline.person_clusterer import cluster_persons
+        track_ids = list(track_fragments.keys())
+        cluster_map = cluster_persons(track_ids, embeddings, spans)
+
+        unique_clusters = set(cluster_map.values())
+        print(f"[worker] DBSCAN → {len(unique_clusters)} clusters: {dict(sorted(cluster_map.items()))}")
+
+        await _set(job_id, stage=AnalysisStage.THUMBNAILING, progress=0.7)
+
+        # ── Phase 3: thumbnails (in thread) ──
+        cluster_obs: Dict[int, List[Tuple[int, np.ndarray, float]]] = defaultdict(list)
+        cluster_track_ids: Dict[int, List[int]] = defaultdict(list)
+        for tid, obs in track_fragments.items():
+            cid = cluster_map[tid]
+            cluster_obs[cid].extend(obs)
+            cluster_track_ids[cid].append(tid)
+
+        person_ids = {cid: f"person_{cid}" for cid in cluster_obs}
+        await loop.run_in_executor(
+            None,
+            lambda: _sync_thumbnails(job_id, video_path, cluster_obs, person_ids),
+        )
+
+        # ── Build Person models ──
+        persons = []
+        for cid, tids in cluster_track_ids.items():
+            all_obs = cluster_obs[cid]
+            all_frames = [o[0] for o in all_obs]
+            persons.append(
+                Person(
+                    person_id=person_ids[cid],
+                    cluster_id=cid,
+                    track_ids=tids,
+                    thumbnail_file=f"{person_ids[cid]}.jpg",
+                    frame_count=len(all_obs),
+                    first_frame=min(all_frames),
+                    last_frame=max(all_frames),
+                )
+            )
+        persons.sort(key=lambda p: p.frame_count, reverse=True)
+
+        job_store.set_persons(job_id, persons)
+        _track_fragments_cache[job_id] = dict(track_fragments)
+        _cluster_map_cache[job_id] = cluster_map
+
+        await _set(job_id, status=JobStatus.READY_FOR_SELECTION, stage=None, progress=1.0)
+
+    except Exception as e:
+        await _set(job_id, status=JobStatus.ERROR, error=str(e))
+        print(f"[worker] analysis error for {job_id}:\n{traceback.format_exc()}")
+
+
+async def run_generation(job_id: str, person_id: str, video_path: Path):
+    loop = asyncio.get_running_loop()
+
+    def push(**kwargs):
+        loop.call_soon_threadsafe(
+            lambda kw=kwargs: asyncio.ensure_future(_set(job_id, **kw))
+        )
+
+    try:
+        await _set(job_id, status=JobStatus.GENERATING, stage=GenerationStage.RENDERING, progress=0.0)
+
+        cluster_map = _cluster_map_cache.get(job_id, {})
+        track_fragments = _track_fragments_cache.get(job_id, {})
+        if not cluster_map:
+            await _set(job_id, status=JobStatus.ERROR, error="Analysis data not found — re-upload")
+            return
+
+        cluster_id = int(person_id.replace("person_", ""))
+        frame_track_map: Dict[int, np.ndarray] = {}
+        for tid, cid in cluster_map.items():
+            if cid == cluster_id and tid in track_fragments:
+                for frame_idx, xyxy, _ in track_fragments[tid]:
+                    frame_track_map[frame_idx] = xyxy
+
+        if not frame_track_map:
+            await _set(job_id, status=JobStatus.ERROR, error=f"No track data for {person_id}")
+            return
+
+        out_path = output_path(job_id)
+        await loop.run_in_executor(
+            None,
+            lambda: _sync_render(video_path, out_path, frame_track_map, push),
+        )
+
+        await _set(job_id, status=JobStatus.COMPLETE, stage=None, progress=1.0,
+                   output_filename=out_path.name)
+
+    except Exception as e:
+        await _set(job_id, status=JobStatus.ERROR, error=str(e))
+        print(f"[worker] generation error for {job_id}:\n{traceback.format_exc()}")
+
+
+# ── Sync helpers (safe to run in thread pool) ─────────────────────────────────
+
+def _sync_detect_track(
+    video_path: Path,
+    total_frames: int,
+    push: Callable,
+) -> Dict[int, List[Tuple[int, np.ndarray, float]]]:
+    from pipeline.detector import Detector
+    from pipeline.tracker import Tracker
+
+    print("[worker] initialising detector + tracker (may download models)…")
+    detector = Detector()
+    tracker = Tracker()
+    print("[worker] detector + tracker ready")
+
+    track_fragments: Dict[int, List[Tuple[int, np.ndarray, float]]] = defaultdict(list)
+
+    total_dets = 0
+    for frame_idx, total, frame, detections in detector.detect_video(video_path):
+        total_dets += len(detections)
+        track_result = tracker.update(frame, detections)
+        for tid, data in track_result.items():
+            track_fragments[tid].append((frame_idx, data["xyxy"], data["conf"]))
+
+        if frame_idx % 30 == 0:
+            progress = 0.02 + 0.45 * (frame_idx / max(total, 1))
+            push(progress=progress)
+
+    avg_dets = total_dets / max(total_frames, 1)
+    print(f"[worker] detect+track done: {total_frames} frames, "
+          f"avg {avg_dets:.1f} detections/frame, {len(track_fragments)} raw tracks")
+    return dict(track_fragments)
+
+
+def _sync_embed(
+    video_path: Path,
+    track_fragments: Dict[int, List[Tuple[int, np.ndarray, float]]],
+) -> Dict[int, np.ndarray]:
+    try:
+        from pipeline.reid_embedder import ReIDEmbedder
+        embedder = ReIDEmbedder()
+        fragments_for_embed = {
+            tid: [(f, xyxy) for f, xyxy, _ in obs]
+            for tid, obs in track_fragments.items()
+        }
+        return embedder.embed_fragments(video_path, fragments_for_embed)
+    except Exception as e:
+        print(f"[worker] ReID embedder unavailable ({e}), using bbox fallback")
+        # Use mean [cx_norm, cy_norm, w_norm, h_norm] as embedding.
+        # Normalise by frame dims so spatial position distinguishes people.
+        cap = cv2.VideoCapture(str(video_path))
+        fw = cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 1920
+        fh = cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 1080
+        cap.release()
+        embeddings = {}
+        for tid, obs in track_fragments.items():
+            vecs = []
+            for _, xyxy, _ in obs:
+                cx = ((xyxy[0] + xyxy[2]) / 2) / fw
+                cy = ((xyxy[1] + xyxy[3]) / 2) / fh
+                w  = (xyxy[2] - xyxy[0]) / fw
+                h  = (xyxy[3] - xyxy[1]) / fh
+                vecs.append([cx, cy, w, h])
+            arr = np.array(vecs, dtype=np.float32).mean(axis=0)
+            # Tile the 4-dim feature to fill the embedding dimension
+            # so cosine distance reflects actual spatial differences
+            tiled = np.tile(arr, 128).astype(np.float32)  # 512-dim
+            norm = np.linalg.norm(tiled)
+            embeddings[tid] = tiled / norm if norm > 0 else tiled
+        return embeddings
+
+
+def _sync_thumbnails(job_id, video_path, cluster_obs, person_ids):
+    from pipeline.thumbnail_generator import generate_thumbnails
+    generate_thumbnails(job_id, video_path, cluster_obs, person_ids)
+
+
+def _sync_render(video_path, out_path, frame_track_map, push):
+    from pipeline.fancam_renderer import FancamRenderer
+
+    last = [0.0]
+
+    def cb(p: float):
+        if p - last[0] >= 0.02:
+            last[0] = p
+            push(progress=p * 0.9)
+
+    FancamRenderer().render(video_path, out_path, frame_track_map, cb)
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+async def _set(job_id: str, **kwargs):
+    job_store.update(job_id, **kwargs)
+    await asyncio.sleep(0)
