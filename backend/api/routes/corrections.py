@@ -210,6 +210,33 @@ async def get_frame_bboxes(job_id: str, frame_idx: int):
     return {"bboxes": bboxes}
 
 
+@router.get("/corrections/{job_id}/all-bboxes")
+async def get_all_bboxes(job_id: str):
+    """Return ALL bboxes for every frame (for playback overlay)."""
+    _ = job_store.get(job_id)
+    if not _:
+        raise HTTPException(404, "Job not found")
+
+    frame_index = _frame_bbox_index.get(job_id, {})
+    cluster_map = _cluster_map_cache.get(job_id, {})
+
+    result: Dict[str, list] = {}
+    for frame_idx, entries in frame_index.items():
+        bboxes = []
+        for track_id, xyxy, conf in entries:
+            cid = cluster_map.get(track_id)
+            person_id = f"person_{cid}" if cid is not None else None
+            bboxes.append({
+                "track_id": track_id,
+                "person_id": person_id,
+                "xyxy": [round(float(v), 1) for v in xyxy],
+                "conf": round(float(conf), 3),
+            })
+        result[str(frame_idx)] = bboxes
+
+    return {"frames": result}
+
+
 class RedirectBody(BaseModel):
     person_id: str
     from_frame: int
