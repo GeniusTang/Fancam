@@ -4,6 +4,7 @@ import {
   fetchTrackData,
   frameSrc,
   fetchFrameBboxes,
+  fetchAllBboxes,
   redirectTracking,
   undoRedirect,
 } from "../api/corrections";
@@ -41,6 +42,7 @@ export function CorrectionPanel() {
   const [currentFrame, setCurrentFrame] = useState(0);
   const [frameBboxes, setFrameBboxes] = useState<FrameBbox[]>([]);
   const [submitting, setSubmitting] = useState(false);
+  const [playbackSpeed, setPlaybackSpeed] = useState(1);
 
   // Canvas + Video
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -54,6 +56,9 @@ export function CorrectionPanel() {
   const bboxDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const trackMapRef = useRef(trackMap);
   trackMapRef.current = trackMap;
+
+  // All bboxes for playback overlay
+  const allBboxesRef = useRef<Record<number, FrameBbox[]>>({});
 
 
   // ── Load track data ─────────────────────────────────────────────────────
@@ -73,6 +78,10 @@ export function CorrectionPanel() {
         setVideoInfo(data.video_info);
         setCurrentFrame(0);
         currentFrameRef.current = 0;
+        // Load all bboxes for playback overlay
+        fetchAllBboxes(jobId).then((all) => {
+          allBboxesRef.current = all;
+        }).catch(() => {});
         setLoading(false);
       } catch (e) {
         if (!cancelled)
@@ -109,17 +118,43 @@ export function CorrectionPanel() {
       const scaleY = ch / videoInfo.height;
 
       if (playStateRef.current === "playing") {
-        // Playing: only show selected person's bbox (green)
-        const box = trackMapRef.current[frame];
-        if (box) {
-          const [x1, y1, x2, y2] = box;
+        // Playing: show all dancers' boxes
+        const tracked = trackMapRef.current[frame];
+        const others = allBboxesRef.current[frame] || [];
+
+        // Find which bbox matches the tracked position
+        let trackedIdx = -1;
+        if (tracked) {
+          let bestDist = Infinity;
+          const [tx1, ty1, tx2, ty2] = tracked;
+          const tcx = (tx1 + tx2) / 2, tcy = (ty1 + ty2) / 2;
+          for (let i = 0; i < others.length; i++) {
+            const [bx1, by1, bx2, by2] = others[i].xyxy;
+            const d = Math.hypot(tcx - (bx1 + bx2) / 2, tcy - (by1 + by2) / 2);
+            if (d < bestDist) { bestDist = d; trackedIdx = i; }
+          }
+        }
+
+        // Draw other dancers first (orange, thinner)
+        for (let i = 0; i < others.length; i++) {
+          if (i === trackedIdx) continue;
+          const [x1, y1, x2, y2] = others[i].xyxy;
+          ctx.lineWidth = 1.5;
+          ctx.strokeStyle = "rgba(249,115,22,0.5)";
+          ctx.strokeRect(
+            x1 * scaleX, y1 * scaleY,
+            (x2 - x1) * scaleX, (y2 - y1) * scaleY
+          );
+        }
+
+        // Draw tracked person on top (green, thicker)
+        if (tracked) {
+          const [x1, y1, x2, y2] = tracked;
           ctx.lineWidth = 3;
           ctx.strokeStyle = "#22c55e";
           ctx.strokeRect(
-            x1 * scaleX,
-            y1 * scaleY,
-            (x2 - x1) * scaleX,
-            (y2 - y1) * scaleY
+            x1 * scaleX, y1 * scaleY,
+            (x2 - x1) * scaleX, (y2 - y1) * scaleY
           );
         }
       } else {
@@ -267,9 +302,10 @@ export function CorrectionPanel() {
     playStateRef.current = "playing";
     setPlayState("playing");
     setFrameBboxes([]);
+    video.playbackRate = playbackSpeed;
     video.play();
     animFrameRef.current = requestAnimationFrame(playLoop);
-  }, [playLoop, videoInfo]);
+  }, [playLoop, videoInfo, playbackSpeed]);
 
   const pause = useCallback(() => {
     const video = videoRef.current;
@@ -578,6 +614,20 @@ export function CorrectionPanel() {
           Undo redirect ({redirectCount})
         </button>
         <div style={styles.toolSep} />
+        <select
+          style={styles.speedSelect}
+          value={playbackSpeed}
+          onChange={(e) => {
+            const speed = Number(e.target.value);
+            setPlaybackSpeed(speed);
+            if (videoRef.current) videoRef.current.playbackRate = speed;
+          }}
+        >
+          {[1, 1.5, 2, 3, 4, 5, 8, 10].map((s) => (
+            <option key={s} value={s}>{s}x</option>
+          ))}
+        </select>
+        <div style={styles.toolSep} />
         <button
           style={styles.generateBtn}
           onClick={handleGenerate}
@@ -818,6 +868,15 @@ const styles: Record<string, React.CSSProperties> = {
     background: "#7c6aff22",
     color: "#a78bfa",
     border: "1px solid #7c6aff",
+    borderRadius: 8,
+    fontSize: 13,
+    cursor: "pointer",
+  },
+  speedSelect: {
+    padding: "7px 8px",
+    background: "#1a1a1a",
+    color: "#ccc",
+    border: "1px solid #333",
     borderRadius: 8,
     fontSize: 13,
     cursor: "pointer",

@@ -45,6 +45,19 @@ export async function fetchFrameBboxes(
   return data.bboxes;
 }
 
+export async function fetchAllBboxes(
+  jobId: string
+): Promise<Record<number, FrameBbox[]>> {
+  const { data } = await client.get<{ frames: Record<string, FrameBbox[]> }>(
+    `/corrections/${jobId}/all-bboxes`
+  );
+  const result: Record<number, FrameBbox[]> = {};
+  for (const [k, v] of Object.entries(data.frames)) {
+    result[Number(k)] = v;
+  }
+  return result;
+}
+
 export async function redirectTracking(
   jobId: string,
   personId: string,
