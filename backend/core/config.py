@@ -30,7 +30,7 @@ class Settings(BaseSettings):
     cluster_distance_threshold: float = 0.25   # complete-linkage cosine distance
     embedding_sample_frames: int = 30
 
-    gaussian_sigma: float = 15.0          # Gaussian smoothing sigma (frames); ~0.5s at 30fps
+    gaussian_sigma: float = 15.0           # Gaussian smoothing sigma (frames); ~0.5s at 30fps
 
     class Config:
         env_prefix = "FANCAM_"

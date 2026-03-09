@@ -66,24 +66,33 @@ async def run_analysis(job_id: str, video_path: Path):
 
         await _set(job_id, stage=AnalysisStage.CLUSTERING, progress=0.5)
 
-        # ── Phase 2: embed + cluster (in thread) ──
+        # ── Phase 2: embed (body + face) + thumbnails in single video pass ──
         spans = {
             tid: (min(o[0] for o in obs), max(o[0] for o in obs))
             for tid, obs in track_fragments.items()
         }
-        embeddings = await loop.run_in_executor(
-            None, lambda: _sync_embed(video_path, track_fragments)
+
+        # Build cluster info early so thumbnails can be done in the same pass
+        # Use a temporary 1:1 cluster map (each track = own cluster) for the pass,
+        # then re-do with real clustering. But we need cluster_obs for thumbnails
+        # which requires cluster_map... So we do a 2-step:
+        #   Step 1: single pass for embeddings (body + face)
+        #   Step 2: cluster
+        #   Step 3: single pass for thumbnails only
+        # Actually, thumbnails need cluster_obs which depends on cluster_map.
+        # But we can pre-build cluster_obs using ALL track observations and
+        # just pick best per cluster after clustering. Let's do it in 2 passes:
+        #   Pass 1: body + face embeddings (sampled frames only)
+        #   Then cluster
+        #   Pass 2: thumbnails (needs cluster info)
+        # This is still better: we merged 2 video passes (body + face) into 1.
+
+        embeddings, face_embeddings = await loop.run_in_executor(
+            None, lambda: _sync_embed_all(video_path, track_fragments)
         )
 
-        print(f"[worker] embeddings: {len(embeddings)} tracks, "
-              f"dim={next(iter(embeddings.values())).shape[0] if embeddings else 0}")
-
-        # Face embeddings for improved clustering
-        face_embeddings = await loop.run_in_executor(
-            None, lambda: _sync_face_embed(video_path, track_fragments)
-        )
-        face_count = sum(1 for v in face_embeddings.values() if v is not None)
-        print(f"[worker] face embeddings: {face_count}/{len(face_embeddings)} tracks have faces")
+        print(f"[worker] embeddings: {len(embeddings)} body, "
+              f"{sum(1 for v in face_embeddings.values() if v is not None)} faces")
 
         from pipeline.person_clusterer import cluster_persons
         track_ids = list(track_fragments.keys())
@@ -263,44 +272,18 @@ def _sync_detect_track(
     return dict(track_fragments)
 
 
-def _sync_embed(
-    video_path: Path,
-    track_fragments: Dict[int, List[Tuple[int, np.ndarray, float]]],
-) -> Dict[int, np.ndarray]:
-    try:
-        from pipeline.reid_embedder import ReIDEmbedder
-        embedder = ReIDEmbedder()
-        return embedder.embed_fragments(video_path, track_fragments)
-    except Exception as e:
-        print(f"[worker] ReID embedder unavailable ({e}), using bbox fallback")
-        cap = cv2.VideoCapture(str(video_path))
-        fw = cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 1920
-        fh = cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 1080
-        cap.release()
-        embeddings = {}
-        for tid, obs in track_fragments.items():
-            vecs = []
-            for _, xyxy, _ in obs:
-                cx = ((xyxy[0] + xyxy[2]) / 2) / fw
-                cy = ((xyxy[1] + xyxy[3]) / 2) / fh
-                w  = (xyxy[2] - xyxy[0]) / fw
-                h  = (xyxy[3] - xyxy[1]) / fh
-                vecs.append([cx, cy, w, h])
-            arr = np.array(vecs, dtype=np.float32).mean(axis=0)
-            tiled = np.tile(arr, 128).astype(np.float32)  # 512-dim
-            norm = np.linalg.norm(tiled)
-            embeddings[tid] = tiled / norm if norm > 0 else tiled
-        return embeddings
-
-
-def _sync_face_embed(video_path, track_fragments):
-    try:
-        from pipeline.face_embedder import FaceEmbedder
-        embedder = FaceEmbedder()
-        return embedder.embed_fragments(video_path, track_fragments)
-    except Exception as e:
-        print(f"[worker] face embedder unavailable ({e}), skipping face features")
-        return {tid: None for tid in track_fragments}
+def _sync_embed_all(video_path, track_fragments):
+    """Single video pass: body ReID + face embeddings."""
+    from pipeline.post_tracker import PostTracker
+    pt = PostTracker()
+    # Pass empty cluster_obs and person_ids — thumbnails done separately after clustering
+    return pt.run(
+        job_id="",
+        video_path=video_path,
+        track_fragments=track_fragments,
+        cluster_obs={},
+        person_ids={},
+    )
 
 
 def _sync_thumbnails(job_id, video_path, cluster_obs, person_ids):

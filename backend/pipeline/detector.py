@@ -30,7 +30,7 @@ class Detector:
                 results = self._model(
                     frame, classes=[0], verbose=False,
                     device=settings.device, conf=settings.yolo_conf,
-                    imgsz=960,
+                    imgsz=960, half=True,
                 )
                 boxes = []
                 for r in results:

@@ -21,7 +21,7 @@ class ReIDEmbedder:
         self._reid = ReID(
             weights=settings.reid_model,
             device=settings.device,
-            half=False,
+            half=True,
         )
         print("[reid] ready")
 
