@@ -42,6 +42,15 @@ class FancamRenderer:
         frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         cap.release()
 
+        # Scale output to match source quality (9:16 portrait)
+        # Use source height as the output height, capped at source dimensions
+        self.out_h = min(frame_h, max(self.out_h, frame_h))
+        self.out_w = int(self.out_h * 9 / 16)
+        # Ensure even dimensions for H.264
+        self.out_w = self.out_w + (self.out_w % 2)
+        self.out_h = self.out_h + (self.out_h % 2)
+        print(f"[render] output resolution: {self.out_w}x{self.out_h} (source: {frame_w}x{frame_h})")
+
         # ── Pass 1: Build smoothed camera path ──────────────────────────
         cam_path = self._build_camera_path(frame_track_map, total, frame_w, frame_h)
 
@@ -160,7 +169,7 @@ class FancamRenderer:
                 cv2.BORDER_CONSTANT, value=(0, 0, 0)
             )
 
-        return cv2.resize(crop, (self.out_w, self.out_h), interpolation=cv2.INTER_LINEAR)
+        return cv2.resize(crop, (self.out_w, self.out_h), interpolation=cv2.INTER_LANCZOS4)
 
     def _letterbox(self, frame: np.ndarray) -> np.ndarray:
         h, w = frame.shape[:2]

@@ -18,6 +18,8 @@ from storage.file_manager import output_path
 # ── In-memory caches (MVP — lost on restart) ──────────────────────────────────
 _track_fragments_cache: Dict[str, Dict] = {}
 _cluster_map_cache: Dict[str, Dict] = {}
+# job_id → frame_idx → [(track_id, xyxy, conf), ...]
+_frame_bbox_index: Dict[str, Dict[int, List[Tuple[int, np.ndarray, float]]]] = {}
 
 
 # ── Async entry points ────────────────────────────────────────────────────────
@@ -76,9 +78,16 @@ async def run_analysis(job_id: str, video_path: Path):
         print(f"[worker] embeddings: {len(embeddings)} tracks, "
               f"dim={next(iter(embeddings.values())).shape[0] if embeddings else 0}")
 
+        # Face embeddings for improved clustering
+        face_embeddings = await loop.run_in_executor(
+            None, lambda: _sync_face_embed(video_path, track_fragments)
+        )
+        face_count = sum(1 for v in face_embeddings.values() if v is not None)
+        print(f"[worker] face embeddings: {face_count}/{len(face_embeddings)} tracks have faces")
+
         from pipeline.person_clusterer import cluster_persons
         track_ids = list(track_fragments.keys())
-        cluster_map = cluster_persons(track_ids, embeddings, spans)
+        cluster_map = cluster_persons(track_ids, embeddings, spans, face_embeddings=face_embeddings)
 
         unique_clusters = set(cluster_map.values())
         print(f"[worker] clustering → {len(unique_clusters)} clusters: {dict(sorted(cluster_map.items()))}")
@@ -121,6 +130,13 @@ async def run_analysis(job_id: str, video_path: Path):
         _track_fragments_cache[job_id] = dict(track_fragments)
         _cluster_map_cache[job_id] = cluster_map
 
+        # Build frame-indexed bbox lookup for correction UI
+        frame_index: Dict[int, List[Tuple[int, np.ndarray, float]]] = defaultdict(list)
+        for tid, obs in track_fragments.items():
+            for frame_idx, xyxy, conf in obs:
+                frame_index[frame_idx].append((tid, xyxy, conf))
+        _frame_bbox_index[job_id] = dict(frame_index)
+
         elapsed = time.monotonic() - t0
         print(f"[worker] analysis complete in {elapsed:.1f}s")
         await _set(job_id, status=JobStatus.READY_FOR_SELECTION, stage=None, progress=1.0)
@@ -128,32 +144,6 @@ async def run_analysis(job_id: str, video_path: Path):
     except Exception as e:
         await _set(job_id, status=JobStatus.ERROR, error=str(e))
         print(f"[worker] analysis error for {job_id}:\n{traceback.format_exc()}")
-
-
-async def run_preview(job_id: str, person_id: str, video_path: Path) -> Path:
-    """Generate a short preview clip with bbox overlay for the selected person."""
-    loop = asyncio.get_running_loop()
-
-    cluster_map = _cluster_map_cache.get(job_id, {})
-    track_fragments = _track_fragments_cache.get(job_id, {})
-    if not cluster_map:
-        raise ValueError("Analysis data not found — re-upload")
-
-    cluster_id = int(person_id.replace("person_", ""))
-    frame_track_map: Dict[int, np.ndarray] = {}
-    for tid, cid in cluster_map.items():
-        if cid == cluster_id and tid in track_fragments:
-            for frame_idx, xyxy, _ in track_fragments[tid]:
-                frame_track_map[frame_idx] = xyxy
-
-    if not frame_track_map:
-        raise ValueError(f"No track data for {person_id}")
-
-    preview_path = await loop.run_in_executor(
-        None,
-        lambda: _sync_preview(video_path, frame_track_map, job_id, person_id),
-    )
-    return preview_path
 
 
 async def run_generation(job_id: str, person_id: str, video_path: Path):
@@ -176,14 +166,29 @@ async def run_generation(job_id: str, person_id: str, video_path: Path):
 
         cluster_id = int(person_id.replace("person_", ""))
         frame_track_map: Dict[int, np.ndarray] = {}
+        frame_conf_map: Dict[int, float] = {}
         for tid, cid in cluster_map.items():
             if cid == cluster_id and tid in track_fragments:
-                for frame_idx, xyxy, _ in track_fragments[tid]:
-                    frame_track_map[frame_idx] = xyxy
+                for frame_idx, xyxy, conf in track_fragments[tid]:
+                    if frame_idx not in frame_track_map or conf > frame_conf_map[frame_idx]:
+                        frame_track_map[frame_idx] = xyxy
+                        frame_conf_map[frame_idx] = conf
 
         if not frame_track_map:
             await _set(job_id, status=JobStatus.ERROR, error=f"No track data for {person_id}")
             return
+
+        # Apply redirect rules if any
+        from core.corrections import _redirect_rules, apply_redirects
+        rules = _redirect_rules.get(job_id, [])
+        if rules:
+            frame_track_map = apply_redirects(frame_track_map, rules, track_fragments, cluster_map, person_id)
+
+        # Apply user corrections if any
+        from core.corrections import _corrections_cache, apply_corrections
+        corrections = _corrections_cache.get(job_id, {})
+        if corrections:
+            frame_track_map = apply_corrections(frame_track_map, corrections)
 
         out_path = output_path(job_id)
 
@@ -288,6 +293,16 @@ def _sync_embed(
         return embeddings
 
 
+def _sync_face_embed(video_path, track_fragments):
+    try:
+        from pipeline.face_embedder import FaceEmbedder
+        embedder = FaceEmbedder()
+        return embedder.embed_fragments(video_path, track_fragments)
+    except Exception as e:
+        print(f"[worker] face embedder unavailable ({e}), skipping face features")
+        return {tid: None for tid in track_fragments}
+
+
 def _sync_thumbnails(job_id, video_path, cluster_obs, person_ids):
     from pipeline.thumbnail_generator import generate_thumbnails
     generate_thumbnails(job_id, video_path, cluster_obs, person_ids)
@@ -304,73 +319,6 @@ def _sync_render(video_path, out_path, frame_track_map, push):
             push(p)
 
     FancamRenderer().render(video_path, out_path, frame_track_map, cb)
-
-
-def _sync_preview(
-    video_path: Path,
-    frame_track_map: Dict[int, np.ndarray],
-    job_id: str,
-    person_id: str,
-) -> Path:
-    """Generate a short preview clip with bbox overlay from the middle of the video."""
-    from core.config import settings
-
-    cap = cv2.VideoCapture(str(video_path))
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-
-    preview_frames = int(fps * settings.preview_duration)
-
-    # Find the middle of the person's appearance
-    sorted_frames = sorted(frame_track_map.keys())
-    mid_idx = len(sorted_frames) // 2
-    mid_frame = sorted_frames[mid_idx]
-
-    # Center the preview window around the middle frame
-    start_frame = max(0, mid_frame - preview_frames // 2)
-    end_frame = min(total, start_frame + preview_frames)
-    start_frame = max(0, end_frame - preview_frames)
-
-    preview_path = settings.output_dir / f"{job_id}_preview_{person_id}.mp4"
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(str(preview_path), fourcc, fps, (frame_w, frame_h))
-
-    cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
-    for fidx in range(start_frame, end_frame):
-        ret, frame = cap.read()
-        if not ret:
-            break
-
-        xyxy = frame_track_map.get(fidx)
-        if xyxy is not None:
-            x1, y1, x2, y2 = [int(v) for v in xyxy]
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (124, 106, 255), 3)
-
-        writer.write(frame)
-
-    cap.release()
-    writer.release()
-
-    # Re-encode for browser compatibility
-    import ffmpeg
-    final_path = preview_path.with_suffix(".final.mp4")
-    try:
-        (
-            ffmpeg.input(str(preview_path))
-            .output(str(final_path), vcodec="libx264", crf=23, preset="ultrafast",
-                    movflags="+faststart", r=fps)
-            .overwrite_output()
-            .run(quiet=True)
-        )
-        preview_path.unlink(missing_ok=True)
-        final_path.rename(preview_path)
-    except Exception:
-        if final_path.exists():
-            final_path.unlink(missing_ok=True)
-
-    return preview_path
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

@@ -23,7 +23,7 @@ async def generate_fancam(req: GenerateRequest):
     job = job_store.get(req.job_id)
     if job is None:
         raise HTTPException(404, "Job not found")
-    if job.status not in (JobStatus.READY_FOR_SELECTION, JobStatus.PREVIEWING):
+    if job.status != JobStatus.READY_FOR_SELECTION:
         raise HTTPException(409, f"Job not ready for generation (status: {job.status})")
 
     persons = job_store.get_persons(req.job_id)
@@ -37,6 +37,7 @@ async def generate_fancam(req: GenerateRequest):
         raise HTTPException(500, "Source video missing")
 
     job_store.update(req.job_id, selected_person_id=req.person_id)
-    asyncio.create_task(run_generation(req.job_id, req.person_id, video_path))
+    task = asyncio.create_task(run_generation(req.job_id, req.person_id, video_path))
+    job_store.set_task(req.job_id, task)
 
     return JSONResponse({"job_id": req.job_id, "person_id": req.person_id})

@@ -35,7 +35,7 @@ export function useJobStatus(jobId: string | null) {
         if (evt.status === "ready_for_selection") {
           shutdown();
           try {
-            const result = await fetchAnalysis(jobId);
+            const result = await fetchAnalysis(jobId!);
             setPersons(result.persons);
             if (result.total_frames) setTotalFrames(result.total_frames);
             setPhase("select_dancer");

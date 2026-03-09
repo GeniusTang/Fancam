@@ -20,7 +20,7 @@ class Settings(BaseSettings):
     fancam_width: int = 720
     fancam_height: int = 1280
 
-    yolo_model: str = "yolov8x.pt"        # extra-large — best accuracy for occluded/overlapping
+    yolo_model: str = "yolo26x.pt"         # YOLO26 extra-large — NMS-free, faster, better accuracy
     yolo_conf: float = 0.45               # raise from default 0.25 to cut false positives
     min_person_area: float = 0.005        # ignore boxes < 0.5% of frame (distant crowd)
     max_person_area: float = 0.80         # ignore boxes > 80% of frame (full-frame artefacts)
@@ -31,7 +31,6 @@ class Settings(BaseSettings):
     embedding_sample_frames: int = 30
 
     gaussian_sigma: float = 15.0          # Gaussian smoothing sigma (frames); ~0.5s at 30fps
-    preview_duration: float = 5.0         # preview clip length in seconds
 
     class Config:
         env_prefix = "FANCAM_"
