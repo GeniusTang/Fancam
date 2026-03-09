@@ -18,7 +18,7 @@ class Tracker:
         self._tracker = BotSort(
             reid_weights=settings.reid_model,
             device=torch.device(settings.device),
-            half=False,
+            half=True,
         )
         print("[tracker] ready")
 

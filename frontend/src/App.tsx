@@ -31,19 +31,44 @@ export default function App() {
   // Keep screen awake during all active phases
   const wakeLockRef = useRef<WakeLockSentinel | null>(null);
   const active = phase !== "upload" && phase !== "error" && phase !== "complete";
+
   useEffect(() => {
     if (!active) {
       wakeLockRef.current?.release();
       wakeLockRef.current = null;
       return;
     }
-    let released = false;
-    navigator.wakeLock?.request("screen").then((lock) => {
-      if (released) { lock.release(); return; }
-      wakeLockRef.current = lock;
-    }).catch(() => {});
+
+    let cancelled = false;
+
+    function acquireLock() {
+      if (cancelled || !navigator.wakeLock) return;
+      navigator.wakeLock.request("screen").then((lock) => {
+        if (cancelled) { lock.release(); return; }
+        wakeLockRef.current = lock;
+        // Re-acquire if the browser releases it (tab hidden then visible again)
+        lock.addEventListener("release", () => {
+          wakeLockRef.current = null;
+          if (!cancelled && document.visibilityState === "visible") {
+            acquireLock();
+          }
+        });
+      }).catch(() => {});
+    }
+
+    // Re-acquire wake lock when tab becomes visible again
+    function onVisibility() {
+      if (document.visibilityState === "visible" && !cancelled && !wakeLockRef.current) {
+        acquireLock();
+      }
+    }
+
+    acquireLock();
+    document.addEventListener("visibilitychange", onVisibility);
+
     return () => {
-      released = true;
+      cancelled = true;
+      document.removeEventListener("visibilitychange", onVisibility);
       wakeLockRef.current?.release();
       wakeLockRef.current = null;
     };

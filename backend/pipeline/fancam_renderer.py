@@ -4,10 +4,7 @@ Two-pass architecture:
   1. Collect all bbox data for the selected person across all frames
   2. Apply scipy.ndimage.gaussian_filter1d on full cx/cy/w/h arrays — zero-lag,
      uses both past and future context for silky-smooth camera movement
-  3. Render cropped frames using the smoothed camera path
-
-No Kalman filter, no EMA, no velocity clamping — the Gaussian filter handles
-everything in a single non-causal pass.
+  3. Pipe raw cropped frames directly to ffmpeg (single H.264 encode, no lossy intermediate)
 """
 import platform
 import subprocess
@@ -17,7 +14,6 @@ from typing import Callable, Dict, Optional
 import cv2
 import numpy as np
 from scipy.ndimage import gaussian_filter1d
-import ffmpeg
 
 from core.config import settings
 
@@ -43,10 +39,8 @@ class FancamRenderer:
         cap.release()
 
         # Scale output to match source quality (9:16 portrait)
-        # Use source height as the output height, capped at source dimensions
         self.out_h = min(frame_h, max(self.out_h, frame_h))
         self.out_w = int(self.out_h * 9 / 16)
-        # Ensure even dimensions for H.264
         self.out_w = self.out_w + (self.out_w % 2)
         self.out_h = self.out_h + (self.out_h % 2)
         print(f"[render] output resolution: {self.out_w}x{self.out_h} (source: {frame_w}x{frame_h})")
@@ -54,31 +48,72 @@ class FancamRenderer:
         # ── Pass 1: Build smoothed camera path ──────────────────────────
         cam_path = self._build_camera_path(frame_track_map, total, frame_w, frame_h)
 
-        # ── Pass 2: Render frames using smoothed camera ─────────────────
+        # ── Pass 2: Pipe raw frames to ffmpeg ────────────────────────────
+        ffmpeg_cmd = _build_ffmpeg_cmd(
+            output_path, self.out_w, self.out_h, fps, video_path,
+        )
+        print(f"[render] ffmpeg cmd: {' '.join(ffmpeg_cmd)}")
+
+        proc = subprocess.Popen(
+            ffmpeg_cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+
         cap = cv2.VideoCapture(str(video_path))
-        temp_path = output_path.with_suffix(".raw.mp4")
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(str(temp_path), fourcc, fps, (self.out_w, self.out_h))
+        frame_size = self.out_w * self.out_h * 3  # BGR bytes per frame
 
-        for frame_idx in range(total):
-            ret, frame = cap.read()
-            if not ret:
-                break
+        try:
+            for frame_idx in range(total):
+                ret, frame = cap.read()
+                if not ret:
+                    break
 
-            cam = cam_path[frame_idx]
-            if cam is not None:
-                writer.write(self._crop_frame(frame, cam, frame_w, frame_h))
-            else:
-                writer.write(self._letterbox(frame))
+                cam = cam_path[frame_idx]
+                if cam is not None:
+                    out_frame = self._crop_frame(frame, cam, frame_w, frame_h)
+                else:
+                    out_frame = self._letterbox(frame)
 
-            if progress_cb and total > 0:
-                progress_cb(frame_idx / total)
+                # Write raw BGR to ffmpeg stdin
+                proc.stdin.write(out_frame.tobytes())
 
-        cap.release()
-        writer.release()
+                if progress_cb and total > 0:
+                    progress_cb(frame_idx / total)
+        finally:
+            cap.release()
+            proc.stdin.close()
+            proc.wait()
 
-        _reencode(temp_path, output_path, fps, video_path)
-        temp_path.unlink(missing_ok=True)
+        if proc.returncode != 0:
+            stderr = proc.stderr.read().decode(errors="replace")
+            print(f"[render] ffmpeg error: {stderr[-500:]}")
+            # Fallback: try without audio
+            ffmpeg_cmd = _build_ffmpeg_cmd(
+                output_path, self.out_w, self.out_h, fps, None,
+            )
+            proc = subprocess.Popen(
+                ffmpeg_cmd, stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            cap = cv2.VideoCapture(str(video_path))
+            try:
+                for frame_idx in range(total):
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+                    cam = cam_path[frame_idx]
+                    if cam is not None:
+                        out_frame = self._crop_frame(frame, cam, frame_w, frame_h)
+                    else:
+                        out_frame = self._letterbox(frame)
+                    proc.stdin.write(out_frame.tobytes())
+            finally:
+                cap.release()
+                proc.stdin.close()
+                proc.wait()
+
         return output_path
 
     def _build_camera_path(
@@ -88,26 +123,18 @@ class FancamRenderer:
         frame_w: int,
         frame_h: int,
     ) -> list:
-        """Build a smoothed camera path for all frames.
-
-        Returns a list of length total_frames where each element is either
-        a np.ndarray [cx, cy, cw, ch] or None (no person visible).
-        """
         if not frame_track_map:
             return [None] * total_frames
 
-        # Convert all detections to camera targets [cx, cy, cw, ch]
         raw_cams = {}
         for fidx, xyxy in frame_track_map.items():
             raw_cams[fidx] = _xyxy_to_cam(xyxy, frame_w, frame_h, self.out_w, self.out_h)
 
-        # Find contiguous segments where the person is visible
         sorted_frames = sorted(raw_cams.keys())
         first_frame = sorted_frames[0]
         last_frame = sorted_frames[-1]
         span = last_frame - first_frame + 1
 
-        # Build dense arrays for the active span, interpolating gaps
         cx_arr = np.full(span, np.nan, dtype=np.float64)
         cy_arr = np.full(span, np.nan, dtype=np.float64)
         cw_arr = np.full(span, np.nan, dtype=np.float64)
@@ -120,18 +147,15 @@ class FancamRenderer:
             cw_arr[i] = cam[2]
             ch_arr[i] = cam[3]
 
-        # Interpolate gaps (occlusion periods)
         for arr in [cx_arr, cy_arr, cw_arr, ch_arr]:
             _interpolate_nans(arr)
 
-        # Apply Gaussian smoothing — zero-lag bidirectional filter
         sigma = self.sigma
         cx_smooth = gaussian_filter1d(cx_arr, sigma)
         cy_smooth = gaussian_filter1d(cy_arr, sigma)
         cw_smooth = gaussian_filter1d(cw_arr, sigma)
         ch_smooth = gaussian_filter1d(ch_arr, sigma)
 
-        # Build output camera path
         cam_path: list = [None] * total_frames
         for i in range(span):
             fidx = first_frame + i
@@ -150,7 +174,6 @@ class FancamRenderer:
         x2 = x1 + int(round(cw))
         y2 = y1 + int(round(ch))
 
-        # Pad with black instead of clamping, so dancer stays centred
         pad_l = max(0, -x1)
         pad_t = max(0, -y1)
         pad_r = max(0, x2 - fw)
@@ -184,7 +207,6 @@ class FancamRenderer:
 
 
 def _interpolate_nans(arr: np.ndarray):
-    """In-place linear interpolation of NaN gaps in a 1D array."""
     nans = np.isnan(arr)
     if not nans.any():
         return
@@ -213,7 +235,6 @@ def _xyxy_to_cam(xyxy: np.ndarray, fw: int, fh: int, out_w: int, out_h: int) -> 
 
 
 def _has_videotoolbox() -> bool:
-    """Check if h264_videotoolbox encoder is available."""
     if platform.system() != "Darwin":
         return False
     try:
@@ -226,51 +247,77 @@ def _has_videotoolbox() -> bool:
         return False
 
 
-# Cache the check at module load
 _USE_VIDEOTOOLBOX = _has_videotoolbox()
 
 
-def _reencode(src: Path, dst: Path, fps: float, source_video: Path):
-    """Re-encode to H.264 (hardware-accelerated on macOS) and mux original audio."""
+def _probe_bitrate(video_path: Path) -> int:
+    """Get source video bitrate in bits/s. Returns 0 on failure."""
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-select_streams", "v:0",
+             "-show_entries", "format=bit_rate",
+             "-of", "csv=p=0", str(video_path)],
+            capture_output=True, text=True, timeout=10,
+        )
+        val = result.stdout.strip()
+        if val and val != "N/A":
+            return int(val)
+    except Exception:
+        pass
+    return 0
+
+
+def _build_ffmpeg_cmd(
+    output_path: Path,
+    width: int,
+    height: int,
+    fps: float,
+    source_video: Optional[Path],
+) -> list:
+    """Build ffmpeg command that reads raw BGR frames from stdin."""
+    # Probe source bitrate to match quality
+    source_bps = _probe_bitrate(source_video) if source_video else 0
+    # Use at least source bitrate, minimum 15 Mbps
+    target_bps = max(source_bps, 15_000_000)
+    target_bitrate = f"{target_bps // 1_000_000}M"
+
     if _USE_VIDEOTOOLBOX:
         vcodec = "h264_videotoolbox"
-        codec_opts = {"q:v": "65"}  # videotoolbox quality (lower = better, 1-100)
-        print("[render] using h264_videotoolbox (hardware encoder)")
+        codec_args = ["-b:v", target_bitrate]
+        print(f"[render] h264_videotoolbox, bitrate={target_bitrate} (source={source_bps // 1_000_000}M)")
     else:
         vcodec = "libx264"
-        codec_opts = {"crf": "23", "preset": "fast"}
-        print("[render] using libx264 (software encoder)")
+        # CRF 15 = near-visually-lossless, with bitrate floor
+        codec_args = ["-crf", "15", "-preset", "slow", "-bufsize", target_bitrate, "-maxrate", target_bitrate]
+        print(f"[render] libx264 CRF 15, maxrate={target_bitrate} (source={source_bps // 1_000_000}M)")
 
-    try:
-        video_in = ffmpeg.input(str(src))
-        audio_in = ffmpeg.input(str(source_video))
-        (
-            ffmpeg
-            .output(
-                video_in.video,
-                audio_in.audio,
-                str(dst),
-                vcodec=vcodec,
-                acodec="aac",
-                audio_bitrate="192k",
-                movflags="+faststart",
-                r=fps,
-                shortest=None,
-                **codec_opts,
-            )
-            .overwrite_output()
-            .run(quiet=True)
-        )
-    except ffmpeg.Error:
-        # Fallback: try without audio
-        try:
-            (
-                ffmpeg.input(str(src))
-                .output(str(dst), vcodec="libx264", crf=23, preset="fast",
-                        movflags="+faststart", r=fps)
-                .overwrite_output()
-                .run(quiet=True)
-            )
-        except ffmpeg.Error:
-            import shutil
-            shutil.copy2(src, dst)
+    cmd = [
+        "ffmpeg", "-y",
+        "-f", "rawvideo",
+        "-pix_fmt", "bgr24",
+        "-s", f"{width}x{height}",
+        "-r", str(fps),
+        "-i", "pipe:0",
+    ]
+
+    if source_video:
+        cmd += ["-i", str(source_video)]
+
+    cmd += [
+        "-vcodec", vcodec,
+        *codec_args,
+        "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart",
+    ]
+
+    if source_video:
+        cmd += [
+            "-map", "0:v:0",
+            "-map", "1:a:0?",
+            "-acodec", "aac",
+            "-b:a", "256k",
+            "-shortest",
+        ]
+
+    cmd.append(str(output_path))
+    return cmd
