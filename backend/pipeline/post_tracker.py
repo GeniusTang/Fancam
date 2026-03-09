@@ -1,9 +1,10 @@
-"""Single-pass post-tracking: ReID embeddings, face embeddings, and thumbnails.
+"""Single-pass post-tracking: ReID embeddings and thumbnails.
 
-Merges three separate video passes into one sequential read, saving ~2x I/O time.
+Single sequential video read for body ReID embeddings (sampled frames)
+and thumbnail selection (all cluster frames).
 """
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import cv2
 import numpy as np
@@ -44,12 +45,10 @@ def _safe_crop(frame: np.ndarray, xyxy: np.ndarray, h: int, w: int):
 
 
 class PostTracker:
-    """Runs ReID, face embedding, and thumbnail selection in a single video pass."""
+    """Runs ReID embedding and thumbnail selection in a single video pass."""
 
     def __init__(self):
-        # Lazy-load models
         self._reid = None
-        self._face_app = None
 
     def _init_reid(self):
         if self._reid is not None:
@@ -63,22 +62,6 @@ class PostTracker:
         )
         print("[post-tracker] ReID ready")
 
-    def _init_face(self):
-        if self._face_app is not None:
-            return
-        try:
-            from insightface.app import FaceAnalysis
-            print("[post-tracker] loading InsightFace…")
-            self._face_app = FaceAnalysis(
-                name="buffalo_l",
-                providers=["CoreMLExecutionProvider", "CPUExecutionProvider"],
-            )
-            self._face_app.prepare(ctx_id=0, det_size=(160, 160))
-            print("[post-tracker] InsightFace ready")
-        except Exception as e:
-            print(f"[post-tracker] InsightFace unavailable ({e}), skipping face features")
-            self._face_app = False  # sentinel: tried and failed
-
     def run(
         self,
         job_id: str,
@@ -87,31 +70,20 @@ class PostTracker:
         cluster_obs: Dict[int, List[Tuple[int, np.ndarray, float]]],
         person_ids: Dict[int, str],
         sample_n: int = None,
-    ) -> Tuple[
-        Dict[int, np.ndarray],              # body embeddings
-        Dict[int, Optional[np.ndarray]],     # face embeddings
-    ]:
+    ) -> Dict[int, np.ndarray]:
+        """Returns {track_id: body_embedding}."""
         if sample_n is None:
             sample_n = settings.embedding_sample_frames
 
         self._init_reid()
-        self._init_face()
-        face_enabled = self._face_app and self._face_app is not False
 
-        # ── Build frame indices for all three tasks ──────────────────────
+        # ── Build frame indices ───────────────────────────────────────
 
         # ReID: sampled frames per track fragment
         reid_frame_index: Dict[int, List[Tuple[int, np.ndarray, float]]] = {}
         for tid, observations in track_fragments.items():
             for fidx, xyxy, conf in _uniform_sample(observations, sample_n):
                 reid_frame_index.setdefault(fidx, []).append((tid, xyxy, conf))
-
-        # Face: same sampled frames
-        face_frame_index: Dict[int, List[Tuple[int, np.ndarray, float]]] = {}
-        if face_enabled:
-            for tid, observations in track_fragments.items():
-                for fidx, xyxy, conf in _uniform_sample(observations, sample_n):
-                    face_frame_index.setdefault(fidx, []).append((tid, xyxy, conf))
 
         # Thumbnails: all observation frames per cluster
         thumb_frame_index: Dict[int, List[Tuple[int, np.ndarray, float]]] = {}
@@ -120,15 +92,14 @@ class PostTracker:
                 thumb_frame_index.setdefault(fidx, []).append((cid, xyxy, conf))
 
         # Union of all needed frames
-        all_needed = set(reid_frame_index.keys()) | set(face_frame_index.keys()) | set(thumb_frame_index.keys())
+        all_needed = set(reid_frame_index.keys()) | set(thumb_frame_index.keys())
 
-        # ── Accumulators ─────────────────────────────────────────────────
+        # ── Accumulators ──────────────────────────────────────────────
 
         reid_acc: Dict[int, List[Tuple[np.ndarray, float]]] = {tid: [] for tid in track_fragments}
-        face_acc: Dict[int, List[Tuple[np.ndarray, float]]] = {tid: [] for tid in track_fragments}
         thumb_best: Dict[int, Tuple[float, np.ndarray]] = {}
 
-        # ── Single sequential video pass ─────────────────────────────────
+        # ── Single sequential video pass ──────────────────────────────
 
         cap = cv2.VideoCapture(str(video_path))
         fw = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -162,19 +133,6 @@ class PostTracker:
                             if i < len(embs):
                                 reid_acc[tid].append((embs[i], conf))
 
-                # ── Face ──
-                if face_enabled and frame_idx in face_frame_index:
-                    for tid, xyxy, conf in face_frame_index[frame_idx]:
-                        crop = _safe_crop(frame, xyxy, h, w)
-                        if crop is None or crop.size == 0:
-                            continue
-                        faces = self._face_app.get(crop)
-                        if faces:
-                            best = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
-                            if best.embedding is not None:
-                                emb = best.embedding / (np.linalg.norm(best.embedding) + 1e-8)
-                                face_acc[tid].append((emb.astype(np.float32), conf))
-
                 # ── Thumbnails ──
                 if frame_idx in thumb_frame_index:
                     for cid, xyxy, conf in thumb_frame_index[frame_idx]:
@@ -189,7 +147,7 @@ class PostTracker:
         finally:
             cap.release()
 
-        # ── Aggregate ReID embeddings ────────────────────────────────────
+        # ── Aggregate ReID embeddings ─────────────────────────────────
 
         body_embeddings: Dict[int, np.ndarray] = {}
         for tid, feats in reid_acc.items():
@@ -201,19 +159,7 @@ class PostTracker:
             else:
                 body_embeddings[tid] = np.zeros(512, dtype=np.float32)
 
-        # ── Aggregate face embeddings ────────────────────────────────────
-
-        face_embeddings: Dict[int, Optional[np.ndarray]] = {}
-        for tid, feats in face_acc.items():
-            if feats:
-                vecs = np.array([f[0] for f in feats], dtype=np.float32)
-                weights = np.array([f[1] for f in feats], dtype=np.float32)
-                weights = weights / weights.sum()
-                face_embeddings[tid] = (vecs * weights[:, None]).sum(axis=0).astype(np.float32)
-            else:
-                face_embeddings[tid] = None
-
-        # ── Save thumbnails ──────────────────────────────────────────────
+        # ── Save thumbnails ───────────────────────────────────────────
 
         for cid, (_, crop) in thumb_best.items():
             pid = person_ids.get(cid)
@@ -224,7 +170,6 @@ class PostTracker:
 
         print(f"[post-tracker] single pass complete: "
               f"{len(body_embeddings)} body embs, "
-              f"{sum(1 for v in face_embeddings.values() if v is not None)} face embs, "
               f"{len(thumb_best)} thumbnails")
 
-        return body_embeddings, face_embeddings
+        return body_embeddings

@@ -23,14 +23,10 @@ def cluster_persons(
     embeddings: Dict[int, np.ndarray],
     spans: Dict[int, FragmentSpan],
     distance_threshold: float = None,
-    face_embeddings: Dict[int, np.ndarray] = None,
-    face_weight: float = 0.4,
 ) -> Dict[int, int]:
     """
     Returns {track_id: cluster_label} (label >= 0).
-
-    When face embeddings are available for both tracks in a pair, the final
-    distance is a weighted blend of body ReID and face cosine distances.
+    Uses OSNet body ReID cosine distance with temporal overlap constraint.
     """
     if distance_threshold is None:
         distance_threshold = settings.cluster_distance_threshold
@@ -46,37 +42,7 @@ def cluster_persons(
     mat = normalize(mat, norm="l2")
 
     # Body cosine distance matrix
-    body_dist = np.clip(1.0 - mat @ mat.T, 0.0, 2.0)
-
-    # Face distance matrix (where available)
-    face_dist = None
-    if face_embeddings:
-        face_vecs = []
-        has_face = []
-        for tid in track_ids:
-            fe = face_embeddings.get(tid)
-            if fe is not None:
-                face_vecs.append(fe)
-                has_face.append(True)
-            else:
-                face_vecs.append(np.zeros(512, dtype=np.float32))
-                has_face.append(False)
-
-        face_count = sum(has_face)
-        if face_count >= 2:
-            fmat = np.stack(face_vecs, axis=0)
-            fmat = normalize(fmat, norm="l2")
-            face_dist = np.clip(1.0 - fmat @ fmat.T, 0.0, 2.0)
-
-    # Blend body + face distances
-    dist = body_dist.copy()
-    if face_dist is not None:
-        for i in range(n):
-            for j in range(i + 1, n):
-                if has_face[i] and has_face[j]:
-                    blended = (1 - face_weight) * body_dist[i, j] + face_weight * face_dist[i, j]
-                    dist[i, j] = dist[j, i] = blended
-        print(f"[cluster] face embeddings blended (weight={face_weight})")
+    dist = np.clip(1.0 - mat @ mat.T, 0.0, 2.0)
 
     # Temporal constraint: overlapping fragments → distance = 2.0 (never merge)
     for i in range(n):

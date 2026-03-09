@@ -28,7 +28,7 @@ class Detector:
                 h, w = frame.shape[:2]
                 frame_area = h * w
                 results = self._model(
-                    frame, classes=[0], verbose=False,
+                    frame, verbose=False,
                     device=settings.device, conf=settings.yolo_conf,
                     imgsz=960, half=True,
                 )
@@ -45,7 +45,8 @@ class Detector:
                             continue
                         if (y2 - y1) < h * 0.10:
                             continue
-                        boxes.append({"xyxy": xyxy, "conf": float(box.conf[0])})
+                        conf = box.conf.cpu().numpy()
+                        boxes.append({"xyxy": xyxy, "conf": float(conf.item())})
                 yield frame_idx, total, frame, boxes
                 frame_idx += 1
         finally:
