@@ -32,33 +32,35 @@ Open http://localhost:5173
 
 - **Frontend**: React + TypeScript + Vite + Zustand
 - **Backend**: FastAPI + Python
-- **Detection**: YOLO26x (NMS-free, person class only)
-- **Tracking**: BoT-SORT with OSNet x1_0 ReID backbone
-- **Re-ID**: OSNet body embeddings + InsightFace face embeddings (fused 60/40)
+- **Detection**: YOLO26x-pose (NMS-free, person + skeleton keypoints)
+- **Tracking**: Deep OC-SORT with OSNet x1_0 ReID backbone (virtual trajectory prediction for occlusions)
+- **Re-ID**: OSNet body embeddings (confidence-weighted mean, 30 sampled frames per track)
 - **Clustering**: Agglomerative (complete linkage, cosine distance, temporal overlap constraint)
-- **Camera**: Bidirectional Gaussian smoothing (scipy, zero-lag)
-- **Output**: H.264 MP4 via ffmpeg (h264_videotoolbox on macOS), source-resolution 9:16 portrait
+- **Camera**: Bidirectional Gaussian smoothing (scipy, zero-lag, σ=15)
+- **Output**: H.264 MP4 via ffmpeg (h264_videotoolbox on macOS), source-matched bitrate, 9:16 portrait
 
 ## How It Works
 
 1. **Upload** your video (MP4/MOV/AVI/WebM, up to 500 MB)
 2. **Analysis** runs automatically:
-   - YOLO26x detects persons on every frame
-   - BoT-SORT assigns stable track IDs across frames
-   - OSNet extracts body ReID embeddings per track fragment
-   - InsightFace extracts face embeddings for improved identity matching
-   - Agglomerative clustering merges fragments into unique persons
+   - YOLO26x-pose detects persons and skeletons on every frame (FP16)
+   - Deep OC-SORT tracks individuals with virtual trajectory prediction through occlusions
+   - OSNet extracts body ReID embeddings for re-identification after disappearance
+   - Agglomerative clustering merges track fragments into unique persons
    - Best thumbnail selected per person (sharpness + area + confidence scoring)
 3. **Select** the dancer you want to follow
 4. **Fix tracking** — review the tracking in a video player with bbox overlay:
    - Play/pause with spacebar, step frames with arrow keys
+   - Adjustable playback speed (1x–10x)
+   - All detected dancers shown during playback (orange boxes + green tracked)
    - Click any person (on canvas or sidebar) to redirect tracking
    - Undo redirects with Ctrl+Z
    - Jump markers highlight detected tracking errors
 5. **Generate** — renders the final fancam:
    - Gaussian smoothing produces a cinematic camera path
    - Gap interpolation handles occlusions
-   - Output matches source video resolution (9:16 portrait crop)
+   - Raw BGR frame piping to ffmpeg (no lossy intermediate)
+   - Output matches source video bitrate and resolution (9:16 portrait crop)
 6. **Download** your fancam MP4
 
 ## API
@@ -74,6 +76,7 @@ Open http://localhost:5173
 | GET | `/correction-frame/{job_id}/{frame}` | Single frame as JPEG |
 | GET | `/corrections/{job_id}/{person_id}/track-data` | Full tracking data + jump detection |
 | GET | `/corrections/{job_id}/frame-bboxes/{frame}` | All person bboxes on a frame |
+| GET | `/corrections/{job_id}/all-bboxes` | All bboxes for all frames (playback overlay) |
 | POST | `/corrections/{job_id}/redirect` | Redirect tracking to a different person |
 | POST | `/corrections/{job_id}/undo-redirect` | Undo last redirect |
 | GET | `/health` | Health check |
@@ -91,10 +94,9 @@ backend/
   api/routes/
     upload.py, analysis.py, generate.py, jobs.py, download.py, corrections.py
   pipeline/
-    detector.py              # YOLO26x person detection
-    tracker.py               # BoT-SORT tracking
-    reid_embedder.py         # OSNet body embeddings
-    face_embedder.py         # InsightFace face embeddings
+    detector.py              # YOLO26x-pose person detection
+    tracker.py               # Deep OC-SORT tracking
+    post_tracker.py          # Single-pass ReID embeddings + thumbnails
     person_clusterer.py      # Agglomerative clustering
     thumbnail_generator.py   # Best-frame thumbnail selection
     fancam_renderer.py       # Gaussian-smoothed crop + H.264 encode
@@ -105,13 +107,13 @@ backend/
 
 frontend/
   src/
-    App.tsx                  # Phase state machine
+    App.tsx                  # Phase state machine + Wake Lock
     store/appStore.ts        # Zustand store with persistence
     components/
       UploadZone.tsx         # Drag-and-drop upload
       ProgressPanel.tsx      # Analysis/generation progress
       DancerGrid.tsx         # Person selection grid
-      CorrectionPanel.tsx    # Tracking correction UI
+      CorrectionPanel.tsx    # Tracking correction UI (speed control, all-bbox overlay)
       ResultPanel.tsx        # Download completed fancam
     hooks/
       useUpload.ts, useJobStatus.ts
