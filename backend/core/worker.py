@@ -1,5 +1,7 @@
 """Background worker: runs analysis, preview, and generation pipelines."""
 import asyncio
+import platform
+import subprocess
 import time
 import traceback
 from collections import defaultdict
@@ -15,6 +17,36 @@ from models.person import Person
 from storage.file_manager import output_path
 
 
+# ── macOS sleep prevention via caffeinate ─────────────────────────────────────
+
+_caffeinate_proc: subprocess.Popen | None = None
+_caffeinate_refcount = 0
+
+def _prevent_sleep():
+    """Increment refcount and start caffeinate if needed."""
+    global _caffeinate_proc, _caffeinate_refcount
+    _caffeinate_refcount += 1
+    if _caffeinate_proc is None and platform.system() == "Darwin":
+        try:
+            _caffeinate_proc = subprocess.Popen(
+                ["caffeinate", "-dims"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            print("[worker] caffeinate started (preventing sleep)")
+        except Exception:
+            pass
+
+def _allow_sleep():
+    """Decrement refcount and stop caffeinate when no jobs remain."""
+    global _caffeinate_proc, _caffeinate_refcount
+    _caffeinate_refcount = max(0, _caffeinate_refcount - 1)
+    if _caffeinate_refcount == 0 and _caffeinate_proc is not None:
+        _caffeinate_proc.terminate()
+        _caffeinate_proc = None
+        print("[worker] caffeinate stopped (sleep allowed)")
+
+
 # ── In-memory caches (MVP — lost on restart) ──────────────────────────────────
 _track_fragments_cache: Dict[str, Dict] = {}
 _cluster_map_cache: Dict[str, Dict] = {}
@@ -26,6 +58,7 @@ _frame_bbox_index: Dict[str, Dict[int, List[Tuple[int, np.ndarray, float]]]] = {
 
 async def run_analysis(job_id: str, video_path: Path):
     loop = asyncio.get_running_loop()
+    _prevent_sleep()
 
     def push(**kwargs):
         """Thread-safe progress push to the event loop."""
@@ -72,31 +105,15 @@ async def run_analysis(job_id: str, video_path: Path):
             for tid, obs in track_fragments.items()
         }
 
-        # Build cluster info early so thumbnails can be done in the same pass
-        # Use a temporary 1:1 cluster map (each track = own cluster) for the pass,
-        # then re-do with real clustering. But we need cluster_obs for thumbnails
-        # which requires cluster_map... So we do a 2-step:
-        #   Step 1: single pass for embeddings (body + face)
-        #   Step 2: cluster
-        #   Step 3: single pass for thumbnails only
-        # Actually, thumbnails need cluster_obs which depends on cluster_map.
-        # But we can pre-build cluster_obs using ALL track observations and
-        # just pick best per cluster after clustering. Let's do it in 2 passes:
-        #   Pass 1: body + face embeddings (sampled frames only)
-        #   Then cluster
-        #   Pass 2: thumbnails (needs cluster info)
-        # This is still better: we merged 2 video passes (body + face) into 1.
-
-        embeddings, face_embeddings = await loop.run_in_executor(
+        embeddings = await loop.run_in_executor(
             None, lambda: _sync_embed_all(video_path, track_fragments)
         )
 
-        print(f"[worker] embeddings: {len(embeddings)} body, "
-              f"{sum(1 for v in face_embeddings.values() if v is not None)} faces")
+        print(f"[worker] embeddings: {len(embeddings)} body")
 
         from pipeline.person_clusterer import cluster_persons
         track_ids = list(track_fragments.keys())
-        cluster_map = cluster_persons(track_ids, embeddings, spans, face_embeddings=face_embeddings)
+        cluster_map = cluster_persons(track_ids, embeddings, spans)
 
         unique_clusters = set(cluster_map.values())
         print(f"[worker] clustering → {len(unique_clusters)} clusters: {dict(sorted(cluster_map.items()))}")
@@ -153,10 +170,13 @@ async def run_analysis(job_id: str, video_path: Path):
     except Exception as e:
         await _set(job_id, status=JobStatus.ERROR, error=str(e))
         print(f"[worker] analysis error for {job_id}:\n{traceback.format_exc()}")
+    finally:
+        _allow_sleep()
 
 
 async def run_generation(job_id: str, person_id: str, video_path: Path):
     loop = asyncio.get_running_loop()
+    _prevent_sleep()
     t0 = time.monotonic()
 
     def push(**kwargs):
@@ -230,6 +250,8 @@ async def run_generation(job_id: str, person_id: str, video_path: Path):
     except Exception as e:
         await _set(job_id, status=JobStatus.ERROR, error=str(e))
         print(f"[worker] generation error for {job_id}:\n{traceback.format_exc()}")
+    finally:
+        _allow_sleep()
 
 
 # ── Sync helpers (safe to run in thread pool) ─────────────────────────────────
@@ -273,10 +295,9 @@ def _sync_detect_track(
 
 
 def _sync_embed_all(video_path, track_fragments):
-    """Single video pass: body ReID + face embeddings."""
+    """Single video pass: body ReID embeddings."""
     from pipeline.post_tracker import PostTracker
     pt = PostTracker()
-    # Pass empty cluster_obs and person_ids — thumbnails done separately after clustering
     return pt.run(
         job_id="",
         video_path=video_path,

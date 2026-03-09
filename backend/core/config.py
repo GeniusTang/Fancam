@@ -20,7 +20,7 @@ class Settings(BaseSettings):
     fancam_width: int = 720
     fancam_height: int = 1280
 
-    yolo_model: str = "yolo26x.pt"         # YOLO26 extra-large — NMS-free, faster, better accuracy
+    yolo_model: str = "yolo26x-pose.pt"     # YOLO26 extra-large pose — person-only, NMS-free
     yolo_conf: float = 0.45               # raise from default 0.25 to cut false positives
     min_person_area: float = 0.005        # ignore boxes < 0.5% of frame (distant crowd)
     max_person_area: float = 0.80         # ignore boxes > 80% of frame (full-frame artefacts)
