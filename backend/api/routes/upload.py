@@ -42,7 +42,8 @@ async def upload_video(file: UploadFile = File(...)):
         Job(job_id=job_id, status=JobStatus.PENDING, video_filename=save_path.name)
     )
 
-    # Kick off analysis in background
-    asyncio.create_task(run_analysis(job_id, save_path))
+    # Kick off analysis in background (store ref to prevent GC)
+    task = asyncio.create_task(run_analysis(job_id, save_path))
+    job_store.set_task(job_id, task)
 
     return JSONResponse({"job_id": job_id})

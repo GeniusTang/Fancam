@@ -2,7 +2,7 @@ export type AppPhase =
   | "upload"
   | "analyzing"
   | "select_dancer"
-  | "previewing"
+  | "correcting"
   | "generating"
   | "complete"
   | "error";
@@ -11,7 +11,6 @@ export type JobStatus =
   | "pending"
   | "analyzing"
   | "ready_for_selection"
-  | "previewing"
   | "generating"
   | "complete"
   | "error";
@@ -42,4 +41,47 @@ export interface AnalysisResult {
   job_id: string;
   total_frames?: number;
   persons: Person[];
+}
+
+export interface BboxCorrection {
+  frame_idx: number;
+  action: "set" | "delete";
+  xyxy?: [number, number, number, number];
+}
+
+export interface JumpInfo {
+  frame: number;
+  distance: number;
+}
+
+export interface VideoInfo {
+  width: number;
+  height: number;
+  total_frames: number;
+  fps: number;
+}
+
+export interface TrackDataResponse {
+  frame_track_map: Record<string, [number, number, number, number]>;
+  corrections: Record<string, BboxCorrection>;
+  jumps: JumpInfo[];
+  video_info: VideoInfo;
+}
+
+export interface FrameBbox {
+  track_id: number;
+  person_id: string | null;
+  xyxy: [number, number, number, number];
+  conf: number;
+}
+
+export interface RedirectInfo {
+  from_frame: number;
+  to_track_id: number;
+}
+
+export interface RedirectResponse {
+  frame_track_map: Record<string, [number, number, number, number]>;
+  jumps: JumpInfo[];
+  redirects: RedirectInfo[];
 }

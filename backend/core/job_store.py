@@ -9,6 +9,17 @@ class JobStore:
         self._jobs: Dict[str, Job] = {}
         self._persons: Dict[str, List[Person]] = {}
         self._subscribers: Dict[str, List[asyncio.Queue]] = {}
+        self._tasks: Dict[str, asyncio.Task] = {}  # keep refs to prevent GC
+
+    def set_task(self, job_id: str, task: asyncio.Task):
+        self._tasks[job_id] = task
+
+    def get_task(self, job_id: str) -> Optional[asyncio.Task]:
+        return self._tasks.get(job_id)
+
+    def is_task_alive(self, job_id: str) -> bool:
+        task = self._tasks.get(job_id)
+        return task is not None and not task.done()
 
     def create(self, job: Job) -> Job:
         self._jobs[job.job_id] = job

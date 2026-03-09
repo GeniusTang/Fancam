@@ -51,6 +51,7 @@ export function ProgressPanel() {
   const sseEvent = useAppStore((s) => s.sseEvent);
   const phase = useAppStore((s) => s.phase);
 
+
   const stage = sseEvent?.stage ?? null;
   const progress = sseEvent?.progress ?? 0;
   const eta = sseEvent?.eta ?? null;

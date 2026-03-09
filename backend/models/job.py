@@ -7,7 +7,6 @@ class JobStatus(str, Enum):
     PENDING = "pending"
     ANALYZING = "analyzing"
     READY_FOR_SELECTION = "ready_for_selection"
-    PREVIEWING = "previewing"
     GENERATING = "generating"
     COMPLETE = "complete"
     ERROR = "error"

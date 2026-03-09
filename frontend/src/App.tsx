@@ -1,10 +1,10 @@
-import React from "react";
+import React, { useEffect, useRef } from "react";
 import { useAppStore } from "./store/appStore";
 import { useJobStatus } from "./hooks/useJobStatus";
 import { UploadZone } from "./components/UploadZone";
 import { ProgressPanel } from "./components/ProgressPanel";
 import { DancerGrid } from "./components/DancerGrid";
-import { PreviewPanel } from "./components/PreviewPanel";
+import { CorrectionPanel } from "./components/CorrectionPanel";
 import { ResultPanel } from "./components/ResultPanel";
 
 const errorStyles: React.CSSProperties = {
@@ -27,6 +27,27 @@ export default function App() {
   useJobStatus(
     phase === "analyzing" || phase === "generating" ? jobId : null
   );
+
+  // Keep screen awake during all active phases
+  const wakeLockRef = useRef<WakeLockSentinel | null>(null);
+  const active = phase !== "upload" && phase !== "error" && phase !== "complete";
+  useEffect(() => {
+    if (!active) {
+      wakeLockRef.current?.release();
+      wakeLockRef.current = null;
+      return;
+    }
+    let released = false;
+    navigator.wakeLock?.request("screen").then((lock) => {
+      if (released) { lock.release(); return; }
+      wakeLockRef.current = lock;
+    }).catch(() => {});
+    return () => {
+      released = true;
+      wakeLockRef.current?.release();
+      wakeLockRef.current = null;
+    };
+  }, [active]);
 
   if (phase === "error") {
     return (
@@ -60,8 +81,8 @@ export default function App() {
       return <ProgressPanel />;
     case "select_dancer":
       return <DancerGrid />;
-    case "previewing":
-      return <PreviewPanel />;
+    case "correcting":
+      return <CorrectionPanel />;
     case "complete":
       return <ResultPanel />;
     default:
