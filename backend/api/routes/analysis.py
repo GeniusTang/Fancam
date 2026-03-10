@@ -1,7 +1,11 @@
+import asyncio
+
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse
 
+from core.config import settings
 from core.job_store import job_store
+from core.worker import clear_analysis_cache, run_analysis, _track_fragments_cache, _cluster_map_cache, _frame_bbox_index
 from models.job import JobStatus
 
 router = APIRouter()
@@ -23,7 +27,6 @@ async def get_analysis(job_id: str):
     total_frames = job.total_frames or 1
 
     # Build per-person track spans for timeline visualization
-    from core.worker import _track_fragments_cache, _cluster_map_cache
     track_fragments = _track_fragments_cache.get(job_id, {})
     cluster_map = _cluster_map_cache.get(job_id, {})
 
@@ -53,3 +56,30 @@ async def get_analysis(job_id: str):
             ],
         }
     )
+
+
+@router.post("/reanalyze/{job_id}")
+async def reanalyze(job_id: str):
+    """Clear cache and re-run analysis from scratch."""
+    job = job_store.get(job_id)
+    if job is None:
+        raise HTTPException(404, "Job not found")
+
+    video_path = settings.upload_dir / job.video_filename
+    if not video_path.exists():
+        raise HTTPException(500, "Source video missing")
+
+    # Clear disk cache
+    clear_analysis_cache(video_path)
+
+    # Clear in-memory caches
+    _track_fragments_cache.pop(job_id, None)
+    _cluster_map_cache.pop(job_id, None)
+    _frame_bbox_index.pop(job_id, None)
+
+    # Reset job status and kick off fresh analysis
+    job_store.update(job_id, status=JobStatus.PENDING, stage=None, progress=0.0)
+    task = asyncio.create_task(run_analysis(job_id, video_path))
+    job_store.set_task(job_id, task)
+
+    return JSONResponse({"job_id": job_id, "status": "reanalyzing"})

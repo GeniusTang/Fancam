@@ -30,6 +30,7 @@ class FancamRenderer:
         output_path: Path,
         frame_track_map: Dict[int, np.ndarray],
         progress_cb: Optional[Callable[[float], None]] = None,
+        cuts: list | None = None,
     ) -> Path:
         cap = cv2.VideoCapture(str(video_path))
         fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
@@ -37,6 +38,15 @@ class FancamRenderer:
         frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         cap.release()
+
+        # Build set of frames to skip (cuts)
+        cut_frames: set[int] = set()
+        for c in (cuts or []):
+            for f in range(c["start"], c["end"] + 1):
+                cut_frames.add(f)
+        kept_count = total - len(cut_frames)
+        if cuts:
+            print(f"[render] {len(cut_frames)} frames cut, {kept_count} kept")
 
         # Scale output to match source quality (9:16 portrait)
         self.out_h = min(frame_h, max(self.out_h, frame_h))
@@ -49,8 +59,10 @@ class FancamRenderer:
         cam_path = self._build_camera_path(frame_track_map, total, frame_w, frame_h)
 
         # ── Pass 2: Pipe raw frames to ffmpeg ────────────────────────────
+        kept_segments = _compute_kept_segments(cuts or [], total) if cut_frames else None
         ffmpeg_cmd = _build_ffmpeg_cmd(
             output_path, self.out_w, self.out_h, fps, video_path,
+            kept_segments=kept_segments,
         )
         print(f"[render] ffmpeg cmd: {' '.join(ffmpeg_cmd)}")
 
@@ -58,11 +70,11 @@ class FancamRenderer:
             ffmpeg_cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
         )
 
         cap = cv2.VideoCapture(str(video_path))
-        frame_size = self.out_w * self.out_h * 3  # BGR bytes per frame
+        written = 0
 
         try:
             for frame_idx in range(total):
@@ -70,26 +82,27 @@ class FancamRenderer:
                 if not ret:
                     break
 
+                if frame_idx in cut_frames:
+                    continue
+
                 cam = cam_path[frame_idx]
                 if cam is not None:
                     out_frame = self._crop_frame(frame, cam, frame_w, frame_h)
                 else:
                     out_frame = self._letterbox(frame)
 
-                # Write raw BGR to ffmpeg stdin
                 proc.stdin.write(out_frame.tobytes())
+                written += 1
 
-                if progress_cb and total > 0:
-                    progress_cb(frame_idx / total)
+                if progress_cb and kept_count > 0:
+                    progress_cb(written / kept_count)
         finally:
             cap.release()
             proc.stdin.close()
             proc.wait()
 
         if proc.returncode != 0:
-            stderr = proc.stderr.read().decode(errors="replace")
-            print(f"[render] ffmpeg error: {stderr[-500:]}")
-            # Fallback: try without audio
+            print(f"[render] ffmpeg failed (rc={proc.returncode}), retrying without audio")
             ffmpeg_cmd = _build_ffmpeg_cmd(
                 output_path, self.out_w, self.out_h, fps, None,
             )
@@ -103,6 +116,8 @@ class FancamRenderer:
                     ret, frame = cap.read()
                     if not ret:
                         break
+                    if frame_idx in cut_frames:
+                        continue
                     cam = cam_path[frame_idx]
                     if cam is not None:
                         out_frame = self._crop_frame(frame, cam, frame_w, frame_h)
@@ -267,12 +282,40 @@ def _probe_bitrate(video_path: Path) -> int:
     return 0
 
 
+def _compute_kept_segments(cuts: list, total_frames: int) -> list[tuple[int, int]]:
+    """Given cut ranges, return sorted list of (start, end_inclusive) kept frame segments."""
+    if not cuts:
+        return [(0, total_frames - 1)]
+
+    cut_frames: set[int] = set()
+    for c in cuts:
+        for f in range(c["start"], c["end"] + 1):
+            cut_frames.add(f)
+
+    segments = []
+    in_seg = False
+    seg_start = 0
+    for f in range(total_frames):
+        if f not in cut_frames:
+            if not in_seg:
+                seg_start = f
+                in_seg = True
+        else:
+            if in_seg:
+                segments.append((seg_start, f - 1))
+                in_seg = False
+    if in_seg:
+        segments.append((seg_start, total_frames - 1))
+    return segments
+
+
 def _build_ffmpeg_cmd(
     output_path: Path,
     width: int,
     height: int,
     fps: float,
     source_video: Optional[Path],
+    kept_segments: list[tuple[int, int]] | None = None,
 ) -> list:
     """Build ffmpeg command that reads raw BGR frames from stdin."""
     # Probe source bitrate to match quality
@@ -310,7 +353,26 @@ def _build_ffmpeg_cmd(
         "-movflags", "+faststart",
     ]
 
-    if source_video:
+    if source_video and kept_segments and len(kept_segments) > 1:
+        # Build audio filter to trim and concat matching segments
+        filter_parts = []
+        for i, (seg_start, seg_end) in enumerate(kept_segments):
+            t0 = seg_start / fps
+            t1 = (seg_end + 1) / fps
+            filter_parts.append(
+                f"[1:a]atrim=start={t0:.6f}:end={t1:.6f},asetpts=PTS-STARTPTS[a{i}]"
+            )
+        concat_inputs = "".join(f"[a{i}]" for i in range(len(kept_segments)))
+        filter_parts.append(f"{concat_inputs}concat=n={len(kept_segments)}:v=0:a=1[aout]")
+        filter_str = ";".join(filter_parts)
+        cmd += [
+            "-filter_complex", filter_str,
+            "-map", "0:v:0",
+            "-map", "[aout]",
+            "-acodec", "aac",
+            "-b:a", "256k",
+        ]
+    elif source_video:
         cmd += [
             "-map", "0:v:0",
             "-map", "1:a:0?",

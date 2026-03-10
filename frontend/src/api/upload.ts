@@ -3,10 +3,10 @@ import client from "./client";
 export async function uploadVideo(
   file: File,
   onProgress?: (pct: number) => void
-): Promise<string> {
+): Promise<{ jobId: string; cached: boolean }> {
   const form = new FormData();
   form.append("file", file);
-  const { data } = await client.post<{ job_id: string }>("/upload", form, {
+  const { data } = await client.post<{ job_id: string; cached?: boolean }>("/upload", form, {
     headers: { "Content-Type": "multipart/form-data" },
     onUploadProgress: (e) => {
       if (onProgress && e.total) {
@@ -14,5 +14,5 @@ export async function uploadVideo(
       }
     },
   });
-  return data.job_id;
+  return { jobId: data.job_id, cached: !!data.cached };
 }
