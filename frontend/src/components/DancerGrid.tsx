@@ -1,4 +1,5 @@
-import React from "react";
+import React, { useState } from "react";
+import { reanalyze } from "../api/generate";
 import { useAppStore } from "../store/appStore";
 import type { Person, TrackSpan } from "../types";
 
@@ -11,12 +12,28 @@ const SPAN_COLORS = [
 export function DancerGrid() {
   const persons = useAppStore((s) => s.persons);
   const totalFrames = useAppStore((s) => s.totalFrames);
+  const jobId = useAppStore((s) => s.jobId);
   const setSelectedPerson = useAppStore((s) => s.setSelectedPerson);
   const setPhase = useAppStore((s) => s.setPhase);
+  const setError = useAppStore((s) => s.setError);
+  const [reanalyzing, setReanalyzing] = useState(false);
 
   function handleSelect(personId: string) {
     setSelectedPerson(personId);
     setPhase("correcting");
+  }
+
+  async function handleReanalyze() {
+    if (!jobId || reanalyzing) return;
+    if (!confirm("Clear cache and re-run analysis from scratch?")) return;
+    setReanalyzing(true);
+    try {
+      await reanalyze(jobId);
+      setPhase("analyzing");
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : "Re-analyze failed";
+      setError(msg);
+    }
   }
 
   return (
@@ -37,6 +54,14 @@ export function DancerGrid() {
           />
         ))}
       </div>
+
+      <button
+        onClick={handleReanalyze}
+        disabled={reanalyzing}
+        style={styles.reanalyzeBtn}
+      >
+        {reanalyzing ? "Re-analyzing..." : "Clear cache & re-analyze"}
+      </button>
     </div>
   );
 }
@@ -139,5 +164,15 @@ const styles: Record<string, React.CSSProperties> = {
     background: "#2a2a2a",
     borderRadius: 3,
     overflow: "hidden",
+  },
+  reanalyzeBtn: {
+    marginTop: 16,
+    padding: "10px 24px",
+    background: "transparent",
+    color: "#888",
+    border: "1px solid #444",
+    borderRadius: 8,
+    fontSize: 13,
+    cursor: "pointer",
   },
 };

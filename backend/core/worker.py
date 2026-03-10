@@ -1,6 +1,9 @@
 """Background worker: runs analysis, preview, and generation pipelines."""
 import asyncio
+import hashlib
+import pickle
 import platform
+import shutil
 import subprocess
 import time
 import traceback
@@ -11,10 +14,11 @@ from typing import Callable, Dict, List, Tuple
 import cv2
 import numpy as np
 
+from core.config import settings
 from core.job_store import job_store
 from models.job import JobStatus, AnalysisStage, GenerationStage
 from models.person import Person
-from storage.file_manager import output_path
+from storage.file_manager import output_path, thumbnail_dir
 
 
 # ── macOS sleep prevention via caffeinate ─────────────────────────────────────
@@ -52,6 +56,116 @@ _track_fragments_cache: Dict[str, Dict] = {}
 _cluster_map_cache: Dict[str, Dict] = {}
 # job_id → frame_idx → [(track_id, xyxy, conf), ...]
 _frame_bbox_index: Dict[str, Dict[int, List[Tuple[int, np.ndarray, float]]]] = {}
+
+
+# ── Video fingerprint + disk cache ─────────────────────────────────────────────
+
+def video_fingerprint(video_path: Path) -> str:
+    """Fast fingerprint: file size + MD5 of first 2 MB."""
+    h = hashlib.md5()
+    h.update(str(video_path.stat().st_size).encode())
+    with open(video_path, "rb") as f:
+        h.update(f.read(2 * 1024 * 1024))
+    return h.hexdigest()
+
+
+def _cache_path(fingerprint: str) -> Path:
+    return settings.cache_dir / f"{fingerprint}.pkl"
+
+
+def _save_analysis_cache(
+    fingerprint: str,
+    job_id: str,
+    track_fragments: Dict,
+    cluster_map: Dict,
+    persons: List[Person],
+    total_frames: int,
+    fps: float,
+):
+    """Persist analysis results to disk."""
+    # Convert numpy arrays to lists for pickling reliability
+    serializable_tf = {}
+    for tid, obs in track_fragments.items():
+        serializable_tf[tid] = [(f, xyxy.tolist(), conf) for f, xyxy, conf in obs]
+
+    data = {
+        "track_fragments": serializable_tf,
+        "cluster_map": cluster_map,
+        "persons": [p.model_dump() for p in persons],
+        "total_frames": total_frames,
+        "fps": fps,
+    }
+    # Save thumbnails dir name from source job
+    src_thumb_dir = thumbnail_dir(job_id)
+    thumb_files = list(src_thumb_dir.glob("*.jpg"))
+    data["thumbnails"] = {f.name: f.read_bytes() for f in thumb_files}
+
+    cache_file = _cache_path(fingerprint)
+    with open(cache_file, "wb") as f:
+        pickle.dump(data, f)
+    print(f"[cache] saved analysis cache → {cache_file.name}")
+
+
+def load_analysis_cache(job_id: str, video_path: Path) -> bool:
+    """Try to load cached analysis for this video. Returns True if cache hit."""
+    fp = video_fingerprint(video_path)
+    cache_file = _cache_path(fp)
+    if not cache_file.exists():
+        return False
+
+    try:
+        with open(cache_file, "rb") as f:
+            data = pickle.load(f)
+    except Exception as e:
+        print(f"[cache] failed to load {cache_file}: {e}")
+        cache_file.unlink(missing_ok=True)
+        return False
+
+    # Restore track_fragments (convert lists back to numpy arrays)
+    track_fragments = {}
+    for tid, obs in data["track_fragments"].items():
+        track_fragments[int(tid)] = [
+            (f, np.array(xyxy, dtype=np.float64), conf) for f, xyxy, conf in obs
+        ]
+
+    cluster_map = {int(k): int(v) for k, v in data["cluster_map"].items()}
+    persons = [Person(**p) for p in data["persons"]]
+
+    # Restore thumbnails
+    dst_thumb_dir = thumbnail_dir(job_id)
+    for name, content in data.get("thumbnails", {}).items():
+        (dst_thumb_dir / name).write_bytes(content)
+
+    # Populate in-memory caches
+    _track_fragments_cache[job_id] = track_fragments
+    _cluster_map_cache[job_id] = cluster_map
+
+    frame_index: Dict[int, List[Tuple[int, np.ndarray, float]]] = defaultdict(list)
+    for tid, obs in track_fragments.items():
+        for frame_idx, xyxy, conf in obs:
+            frame_index[frame_idx].append((tid, xyxy, conf))
+    _frame_bbox_index[job_id] = dict(frame_index)
+
+    job_store.set_persons(job_id, persons)
+    job_store.update(
+        job_id,
+        status=JobStatus.READY_FOR_SELECTION,
+        total_frames=data["total_frames"],
+        fps=data["fps"],
+        progress=1.0,
+    )
+
+    print(f"[cache] restored analysis from cache for job {job_id}")
+    return True
+
+
+def clear_analysis_cache(video_path: Path):
+    """Delete cached analysis for a video."""
+    fp = video_fingerprint(video_path)
+    cache_file = _cache_path(fp)
+    if cache_file.exists():
+        cache_file.unlink()
+        print(f"[cache] cleared cache {cache_file.name}")
 
 
 # ── Async entry points ────────────────────────────────────────────────────────
@@ -163,6 +277,10 @@ async def run_analysis(job_id: str, video_path: Path):
                 frame_index[frame_idx].append((tid, xyxy, conf))
         _frame_bbox_index[job_id] = dict(frame_index)
 
+        # Save to disk cache for future runs
+        fp = video_fingerprint(video_path)
+        _save_analysis_cache(fp, job_id, track_fragments, cluster_map, persons, total_frames, fps)
+
         elapsed = time.monotonic() - t0
         print(f"[worker] analysis complete in {elapsed:.1f}s")
         await _set(job_id, status=JobStatus.READY_FOR_SELECTION, stage=None, progress=1.0)
@@ -174,7 +292,7 @@ async def run_analysis(job_id: str, video_path: Path):
         _allow_sleep()
 
 
-async def run_generation(job_id: str, person_id: str, video_path: Path):
+async def run_generation(job_id: str, person_id: str, video_path: Path, cuts: list | None = None):
     loop = asyncio.get_running_loop()
     _prevent_sleep()
     t0 = time.monotonic()
@@ -239,8 +357,11 @@ async def run_generation(job_id: str, person_id: str, video_path: Path):
 
         await loop.run_in_executor(
             None,
-            lambda: _sync_render(video_path, out_path, frame_track_map, progress_with_eta),
+            lambda: _sync_render(video_path, out_path, frame_track_map, progress_with_eta, cuts or []),
         )
+
+        # Bridge the 90%→100% gap while ffmpeg finalises
+        await _set(job_id, progress=0.95, eta=0)
 
         elapsed = time.monotonic() - t0
         print(f"[worker] generation complete in {elapsed:.1f}s")
@@ -312,7 +433,7 @@ def _sync_thumbnails(job_id, video_path, cluster_obs, person_ids):
     generate_thumbnails(job_id, video_path, cluster_obs, person_ids)
 
 
-def _sync_render(video_path, out_path, frame_track_map, push):
+def _sync_render(video_path, out_path, frame_track_map, push, cuts=None):
     from pipeline.fancam_renderer import FancamRenderer
 
     last = [0.0]
@@ -322,7 +443,7 @@ def _sync_render(video_path, out_path, frame_track_map, push):
             last[0] = p
             push(p)
 
-    FancamRenderer().render(video_path, out_path, frame_track_map, cb)
+    FancamRenderer().render(video_path, out_path, frame_track_map, cb, cuts=cuts or [])
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

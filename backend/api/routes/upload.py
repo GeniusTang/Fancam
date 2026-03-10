@@ -7,7 +7,7 @@ from fastapi.responses import JSONResponse
 
 from core.config import settings
 from core.job_store import job_store
-from core.worker import run_analysis
+from core.worker import run_analysis, load_analysis_cache
 from models.job import Job, JobStatus
 from storage.file_manager import generate_job_id, upload_path
 
@@ -41,6 +41,10 @@ async def upload_video(file: UploadFile = File(...)):
     job = job_store.create(
         Job(job_id=job_id, status=JobStatus.PENDING, video_filename=save_path.name)
     )
+
+    # Check disk cache — skip analysis if we have results for this video
+    if load_analysis_cache(job_id, save_path):
+        return JSONResponse({"job_id": job_id, "cached": True})
 
     # Kick off analysis in background (store ref to prevent GC)
     task = asyncio.create_task(run_analysis(job_id, save_path))

@@ -85,3 +85,8 @@ export interface RedirectResponse {
   jumps: JumpInfo[];
   redirects: RedirectInfo[];
 }
+
+export interface CutSection {
+  start: number;  // first frame to cut (inclusive)
+  end: number;    // last frame to cut (inclusive)
+}

@@ -10,6 +10,7 @@ import {
 } from "../api/corrections";
 import { startGeneration } from "../api/generate";
 import type {
+  CutSection,
   FrameBbox,
   JumpInfo,
   TrackDataResponse,
@@ -43,6 +44,8 @@ export function CorrectionPanel() {
   const [frameBboxes, setFrameBboxes] = useState<FrameBbox[]>([]);
   const [submitting, setSubmitting] = useState(false);
   const [playbackSpeed, setPlaybackSpeed] = useState(1);
+  const [cuts, setCuts] = useState<CutSection[]>([]);
+  const [cutStart, setCutStart] = useState<number | null>(null);
 
   // Canvas + Video
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -430,6 +433,40 @@ export function CorrectionPanel() {
     [playState, pause, videoInfo, frameBboxes, personId, handleRedirect]
   );
 
+  // ── Cut helpers ─────────────────────────────────────────────────────
+
+  const handleMarkCutStart = useCallback(() => {
+    setCutStart(currentFrameRef.current);
+  }, []);
+
+  const handleMarkCutEnd = useCallback(() => {
+    if (cutStart === null) return;
+    const end = currentFrameRef.current;
+    const start = Math.min(cutStart, end);
+    const endFrame = Math.max(cutStart, end);
+    setCuts((prev) => {
+      const merged = [...prev, { start, end: endFrame }].sort((a, b) => a.start - b.start);
+      // Merge overlapping
+      const result: CutSection[] = [];
+      for (const c of merged) {
+        if (result.length > 0 && c.start <= result[result.length - 1].end + 1) {
+          result[result.length - 1] = {
+            start: result[result.length - 1].start,
+            end: Math.max(result[result.length - 1].end, c.end),
+          };
+        } else {
+          result.push(c);
+        }
+      }
+      return result;
+    });
+    setCutStart(null);
+  }, [cutStart]);
+
+  const handleRemoveCut = useCallback((index: number) => {
+    setCuts((prev) => prev.filter((_, i) => i !== index));
+  }, []);
+
   // ── Keyboard ──────────────────────────────────────────────────────────
 
   useEffect(() => {
@@ -470,11 +507,17 @@ export function CorrectionPanel() {
       } else if (e.key === "z" && (e.metaKey || e.ctrlKey)) {
         e.preventDefault();
         handleUndo();
+      } else if (e.key === "i" && playStateRef.current === "paused") {
+        e.preventDefault();
+        handleMarkCutStart();
+      } else if (e.key === "o" && playStateRef.current === "paused") {
+        e.preventDefault();
+        handleMarkCutEnd();
       }
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [togglePlay, videoInfo, drawImageFrame, loadFrame, debouncedFetchBboxes]);
+  }, [togglePlay, videoInfo, drawImageFrame, loadFrame, debouncedFetchBboxes, handleMarkCutStart, handleMarkCutEnd]);
 
   // ── Navigation helpers ────────────────────────────────────────────────
 
@@ -535,14 +578,14 @@ export function CorrectionPanel() {
   const handleGenerate = useCallback(async () => {
     setSubmitting(true);
     try {
-      await startGeneration(jobId, personId);
+      await startGeneration(jobId, personId, cuts);
       setPhase("generating");
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to start generation");
     } finally {
       setSubmitting(false);
     }
-  }, [jobId, personId, setPhase, setError]);
+  }, [jobId, personId, cuts, setPhase, setError]);
 
   // ── Timeline click ────────────────────────────────────────────────────
 
@@ -613,6 +656,26 @@ export function CorrectionPanel() {
         >
           Undo redirect ({redirectCount})
         </button>
+        <div style={styles.toolSep} />
+        <button
+          style={cutStart !== null ? styles.toolActive : styles.toolBtn}
+          onClick={cutStart === null ? handleMarkCutStart : handleMarkCutEnd}
+        >
+          {cutStart !== null ? `Cut end (O) — from ${cutStart}` : `Cut start (I)`}
+        </button>
+        {cutStart !== null && (
+          <button
+            style={styles.toolBtn}
+            onClick={() => setCutStart(null)}
+          >
+            Cancel
+          </button>
+        )}
+        {cuts.length > 0 && (
+          <span style={{ fontSize: 12, color: "#ef4444" }}>
+            {cuts.length} cut{cuts.length !== 1 ? "s" : ""}
+          </span>
+        )}
         <div style={styles.toolSep} />
         <select
           style={styles.speedSelect}
@@ -688,6 +751,37 @@ export function CorrectionPanel() {
                 ));
               })()}
 
+            {/* Cut sections */}
+            {cuts.map((c, i) => (
+              <div
+                key={`cut-${i}`}
+                style={{
+                  position: "absolute",
+                  left: `${(c.start / totalFrames) * 100}%`,
+                  width: `${(Math.max(1, c.end - c.start + 1) / totalFrames) * 100}%`,
+                  height: "100%",
+                  background: "rgba(239, 68, 68, 0.35)",
+                  borderLeft: "1px solid #ef4444",
+                  borderRight: "1px solid #ef4444",
+                }}
+              />
+            ))}
+
+            {/* Pending cut start marker */}
+            {cutStart !== null && (
+              <div
+                style={{
+                  position: "absolute",
+                  left: `${(cutStart / totalFrames) * 100}%`,
+                  width: `${(Math.max(1, (currentFrame >= cutStart ? currentFrame - cutStart + 1 : cutStart - currentFrame + 1)) / totalFrames) * 100}%`,
+                  marginLeft: currentFrame < cutStart ? `${((currentFrame - cutStart) / totalFrames) * 100}%` : undefined,
+                  height: "100%",
+                  background: "rgba(239, 68, 68, 0.2)",
+                  border: "1px dashed #ef4444",
+                }}
+              />
+            )}
+
             {/* Jump markers */}
             {jumps.map((j, i) => (
               <div
@@ -732,10 +826,11 @@ export function CorrectionPanel() {
         <div style={styles.sidebar}>
           <h3 style={styles.sidebarTitle}>How to use</h3>
           <ul style={styles.helpList}>
-            <li>Press Space to play/pause</li>
+            <li>Space — play/pause</li>
             <li>Pause when tracking is wrong</li>
-            <li>Click the correct person (orange box or sidebar)</li>
-            <li>Arrow keys to step frame-by-frame</li>
+            <li>Click the correct person to redirect</li>
+            <li>Arrow keys — step frame-by-frame</li>
+            <li>I — mark cut start, O — mark cut end</li>
           </ul>
 
           <h3 style={{ ...styles.sidebarTitle, marginTop: 24 }}>
@@ -761,6 +856,46 @@ export function CorrectionPanel() {
               </button>
             ))}
           </div>
+
+          {cuts.length > 0 && (
+            <>
+              <h3 style={{ ...styles.sidebarTitle, marginTop: 24 }}>
+                Cut Sections
+              </h3>
+              <div style={styles.jumpList}>
+                {cuts.map((c, i) => (
+                  <div
+                    key={`cut-${i}`}
+                    style={{
+                      ...styles.jumpItem,
+                      borderLeft: "3px solid #ef4444",
+                    }}
+                  >
+                    <span
+                      style={{ cursor: "pointer" }}
+                      onClick={() => jumpToFrame(c.start)}
+                    >
+                      {c.start}–{c.end} ({c.end - c.start + 1}f)
+                    </span>
+                    <button
+                      style={{
+                        background: "none",
+                        border: "none",
+                        color: "#888",
+                        cursor: "pointer",
+                        fontSize: 14,
+                        padding: "0 4px",
+                      }}
+                      onClick={() => handleRemoveCut(i)}
+                      title="Remove cut"
+                    >
+                      x
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </>
+          )}
 
           {playState === "paused" && frameBboxes.length > 0 && (() => {
             // Determine which bbox is currently tracked by matching trackMap position

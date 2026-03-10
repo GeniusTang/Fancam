@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     upload_dir: Path = Path("storage/uploads")
     output_dir: Path = Path("storage/outputs")
     thumbnail_dir: Path = Path("storage/thumbnails")
+    cache_dir: Path = Path("storage/cache")
 
     max_upload_size_mb: int = 500
     fancam_width: int = 720
@@ -42,3 +43,4 @@ settings = Settings()
 settings.upload_dir.mkdir(parents=True, exist_ok=True)
 settings.output_dir.mkdir(parents=True, exist_ok=True)
 settings.thumbnail_dir.mkdir(parents=True, exist_ok=True)
+settings.cache_dir.mkdir(parents=True, exist_ok=True)
