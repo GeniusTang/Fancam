@@ -1,6 +1,7 @@
 """Background worker: runs analysis, preview, and generation pipelines."""
 import asyncio
 import hashlib
+import os
 import pickle
 import platform
 import shutil
@@ -33,7 +34,7 @@ def _prevent_sleep():
     if _caffeinate_proc is None and platform.system() == "Darwin":
         try:
             _caffeinate_proc = subprocess.Popen(
-                ["caffeinate", "-dims"],
+                ["caffeinate", "-dims", "-w", str(os.getpid())],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
